@@ -157,6 +157,8 @@ impl WindowContext {
 
         let mut window_context = Self::new(display, config, options, proxy)?;
 
+        // 统一通过事件处理器在 macOS 上前置显示，避免与 AppKit 行为冲突。
+
         // Set the config overrides at startup.
         //
         // These are already applied to `config`, so no update is necessary.
@@ -496,6 +498,11 @@ impl WindowContext {
     /// ID of this terminal context.
     pub fn id(&self) -> WindowId {
         self.display.window.id()
+    }
+
+    /// 是否处于聚焦状态（基于 terminal 的焦点状态）。
+    pub fn is_focused(&self) -> bool {
+        self.terminal.lock().is_focused
     }
 
     /// Write the ref test results to the disk.

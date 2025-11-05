@@ -185,9 +185,12 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "macos")]
     macos::disable_autofill();
 
-    // 在 macOS 菜单栏显示文字（示例：Alacritty）。
+    // 在 macOS 菜单栏显示文字（示例：Alacritty），并注入事件代理用于菜单项操作。
     #[cfg(target_os = "macos")]
-    status_bar::init_status_bar_text("Alacritty");
+    {
+        status_bar::set_event_proxy(window_event_loop.create_proxy());
+        status_bar::init_status_bar_text("Alacritty");
+    }
 
     // Create the IPC socket listener.
     #[cfg(unix)]

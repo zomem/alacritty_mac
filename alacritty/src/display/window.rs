@@ -24,7 +24,7 @@ use std::fmt::{self, Display, Formatter};
 use {
     objc2::MainThreadMarker,
     objc2::runtime::AnyObject,
-    objc2_app_kit::{NSColorSpace, NSView},
+    objc2_app_kit::{NSApplication, NSColorSpace, NSView},
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
 };
 
@@ -265,6 +265,46 @@ impl Window {
     #[inline]
     pub fn focus_window(&self) {
         self.window.focus_window();
+    }
+
+    /// macOS: 将窗口置前并激活应用。
+    #[cfg(target_os = "macos")]
+    pub fn order_front_and_activate(&self) {
+        let _mt = MainThreadMarker::new().expect("must be on main thread");
+        // 激活应用
+        unsafe {
+            let app: *mut NSApplication = objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+            let _: () = objc2::msg_send![app, activateIgnoringOtherApps: true];
+        }
+        // 前置显示窗口
+        match self.window.window_handle().unwrap().as_raw() {
+            RawWindowHandle::AppKit(handle) => unsafe {
+                let view = handle.ns_view.cast::<NSView>().as_ref();
+                let ns_window = view.window().unwrap();
+                let ns_ptr = (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
+                    as *mut objc2_app_kit::NSWindow)
+                    .cast::<AnyObject>();
+                let _: () = objc2::msg_send![ns_ptr, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+            },
+            _ => {}
+        }
+    }
+
+    /// macOS: 隐藏窗口（移出层级）。
+    #[cfg(target_os = "macos")]
+    pub fn order_out(&self) {
+        let _mt = MainThreadMarker::new().expect("must be on main thread");
+        match self.window.window_handle().unwrap().as_raw() {
+            RawWindowHandle::AppKit(handle) => unsafe {
+                let view = handle.ns_view.cast::<NSView>().as_ref();
+                let ns_window = view.window().unwrap();
+                let ns_ptr = (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
+                    as *mut objc2_app_kit::NSWindow)
+                    .cast::<AnyObject>();
+                let _: () = objc2::msg_send![ns_ptr, orderOut: std::ptr::null::<AnyObject>()];
+            },
+            _ => {}
+        }
     }
 
     /// Set the window title.

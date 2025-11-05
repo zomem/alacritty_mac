@@ -98,6 +98,14 @@ pub struct Processor {
     global_ipc_options: ParsedOptions,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
+    /// Track whether all windows are currently shown (macOS menu toggle).
+    windows_shown: bool,
+    /// macOS: 是否需要在本轮事件后评估自动隐藏（用于避免窗口间切换时误隐藏）。
+    #[cfg(target_os = "macos")]
+    pending_auto_hide_eval: bool,
+    /// macOS: 抑制自动隐藏的截止时间（用于刚显示后的瞬时防抖）。
+    #[cfg(target_os = "macos")]
+    suppress_auto_hide_until: Option<Instant>,
 }
 
 impl Processor {
@@ -141,6 +149,11 @@ impl Processor {
             #[cfg(unix)]
             global_ipc_options: Default::default(),
             config_monitor,
+            windows_shown: false,
+            #[cfg(target_os = "macos")]
+            pending_auto_hide_eval: false,
+            #[cfg(target_os = "macos")]
+            suppress_auto_hide_until: None,
         }
     }
 
@@ -161,7 +174,8 @@ impl Processor {
         )?;
 
         self.gl_config = Some(window_context.display.gl_context().config());
-        self.windows.insert(window_context.id(), window_context);
+        let new_id = window_context.id();
+        self.windows.insert(new_id, window_context);
 
         Ok(())
     }
@@ -190,7 +204,17 @@ impl Processor {
             config_overrides,
         )?;
 
-        self.windows.insert(window_context.id(), window_context);
+        let id = window_context.id();
+        self.windows.insert(id, window_context);
+
+        // 若当前通过菜单处于“显示”状态，则让新窗口也立即可见（macOS：前置显示）。
+        #[cfg(target_os = "macos")]
+        if self.windows_shown {
+            // 处于“显示全部”状态时，确保新窗口立即置前显示。
+            if let Some(new_wc) = self.windows.get(&id) {
+                new_wc.display.window.order_front_and_activate();
+            }
+        }
         Ok(())
     }
 
@@ -267,6 +291,12 @@ impl ApplicationHandler<Event> for Processor {
         };
 
         let is_redraw = matches!(event, WindowEvent::RedrawRequested);
+
+        // macOS: 如果当前窗口失去焦点，标记一次“待评估隐藏”。
+        #[cfg(target_os = "macos")]
+        if matches!(event, WindowEvent::Focused(false)) {
+            self.pending_auto_hide_eval = true;
+        }
 
         window_context.handle_event(
             #[cfg(target_os = "macos")]
@@ -369,6 +399,32 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 }
             },
+            // 切换全部窗口显示/隐藏（来自 macOS 状态栏点击）。
+            (EventType::ToggleAllWindows, _) => {
+                let show = !self.windows_shown;
+                #[cfg(target_os = "macos")]
+                if show {
+                    for window_context in self.windows.values() {
+                        window_context.display.window.order_front_and_activate();
+                    }
+                    // 避免刚显示后立刻被“自动隐藏”评估误伤。
+                    self.pending_auto_hide_eval = false;
+                    self.suppress_auto_hide_until = Some(Instant::now() + Duration::from_millis(400));
+                } else {
+                    for window_context in self.windows.values() {
+                        window_context.display.window.order_out();
+                    }
+                    self.pending_auto_hide_eval = false;
+                    self.suppress_auto_hide_until = None;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    for window_context in self.windows.values_mut() {
+                        window_context.display.window.set_visible(show);
+                    }
+                }
+                self.windows_shown = show;
+            },
             // Create a new terminal window.
             (EventType::CreateWindow(options), _) => {
                 // XXX Ensure that no context is current when creating a new window,
@@ -465,6 +521,37 @@ impl ApplicationHandler<Event> for Processor {
             info!(target: LOG_TARGET_WINIT, "About to wait");
         }
 
+        // macOS: 统一时机评估是否需要自动隐藏。
+        // 依据 NSApplication 活跃状态：当应用不再活跃（切到其他应用/点击桌面），隐藏所有窗口；
+        // 在 Alacritty 窗口之间切换时，应用仍然活跃，因此不会误隐藏。
+        #[cfg(target_os = "macos")]
+        {
+            use objc2::{class, msg_send};
+            use objc2_app_kit::NSApplication;
+            unsafe {
+                let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
+                let is_active: bool = msg_send![app, isActive];
+                // 若处于防抖时间窗口内，跳过一次自动隐藏评估。
+                let mut suppressed = false;
+                if let Some(deadline) = self.suppress_auto_hide_until {
+                    if Instant::now() <= deadline {
+                        suppressed = true;
+                    } else {
+                        self.suppress_auto_hide_until = None;
+                    }
+                }
+
+                if !is_active && !suppressed {
+                    for wc in self.windows.values() {
+                        wc.display.window.order_out();
+                    }
+                    self.windows_shown = false;
+                }
+            }
+            // 清除此轮可能残留的评估标志。
+            self.pending_auto_hide_eval = false;
+        }
+
         // Dispatch event to all windows.
         for window_context in self.windows.values_mut() {
             window_context.handle_event(
@@ -542,6 +629,8 @@ pub enum EventType {
     ConfigReload(PathBuf),
     Message(Message),
     Scroll(Scroll),
+    /// Toggle visibility of all windows (macOS menu click).
+    ToggleAllWindows,
     CreateWindow(WindowOptions),
     #[cfg(unix)]
     IpcConfig(IpcConfig),
@@ -1930,6 +2019,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Message(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
+                | EventType::ToggleAllWindows
                 | EventType::Frame => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
@@ -1993,14 +2083,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         }
 
                         self.ctx.update_cursor_blinking();
-                        // macOS：不再在获得焦点时重定位，保留用户最后拖动的位置。
+                        // macOS：不在窗口间切换时主动隐藏，隐藏逻辑移至处理器统一评估。
                         #[cfg(target_os = "macos")]
                         let _ = is_focused;
-                        // 在 macOS 上，当窗口失去焦点时自动隐藏，实现“点击空白区域隐藏”效果。
-                        #[cfg(target_os = "macos")]
-                        if !is_focused {
-                            self.ctx.window().set_visible(false);
-                        }
                         self.on_focus_change(is_focused);
                     },
                     WindowEvent::Occluded(occluded) => {
