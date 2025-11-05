@@ -2,12 +2,70 @@ use objc2::{MainThreadMarker, class, msg_send, sel};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2_foundation::NSString;
-use objc2_app_kit::{NSApplication, NSColor, NSStatusBar, NSStatusItem};
+use objc2_app_kit::{NSApplication, NSStatusBar, NSStatusItem};
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::OnceLock;
 
 // 全局保存指针（原生指针是线程安全可共享的）。
 static STATUS_ITEM_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 static NSWINDOW_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
+// 记录我们创建的标题栏视图，避免重复创建（可为空）。
+//
+
+#[derive(Copy, Clone, Debug)]
+pub struct PopupBorderStyle {
+    pub width: f32,
+    pub color: (u8, u8, u8),
+    pub alpha: f32,
+    pub radius: f64,
+    pub shadow: bool,
+}
+
+static BORDER_STYLE: OnceLock<PopupBorderStyle> = OnceLock::new();
+
+fn parse_border_style_from_env() -> PopupBorderStyle {
+    let mut style = PopupBorderStyle { width: 2.0, color: (0, 0, 0), alpha: 0.4, radius: 8.0, shadow: true };
+    if let Ok(s) = std::env::var("ALACRITTY_POPUP_BORDER") {
+        for part in s.split(',') {
+            let mut it = part.splitn(2, '=');
+            let k = it.next().unwrap_or("").trim().to_ascii_lowercase();
+            let v = it.next().unwrap_or("").trim();
+            match k.as_str() {
+                "width" | "w" => {
+                    if let Ok(f) = v.parse::<f32>() { style.width = f.max(0.0); }
+                },
+                "alpha" | "a" => {
+                    if let Ok(f) = v.parse::<f32>() { style.alpha = f.clamp(0.0, 1.0); }
+                },
+                "radius" | "r" => {
+                    if let Ok(f) = v.parse::<f64>() { style.radius = f.max(0.0); }
+                },
+                "shadow" | "s" => {
+                    let lv = v.to_ascii_lowercase();
+                    style.shadow = matches!(lv.as_str(), "1" | "true" | "yes" | "y" | "on");
+                },
+                "color" | "c" => {
+                    let hex = v.trim_start_matches('#');
+                    if hex.len() == 6 {
+                        if let (Ok(r), Ok(g), Ok(b)) = (
+                            u8::from_str_radix(&hex[0..2], 16),
+                            u8::from_str_radix(&hex[2..4], 16),
+                            u8::from_str_radix(&hex[4..6], 16),
+                        ) {
+                            style.color = (r, g, b);
+                        }
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+    style
+}
+
+pub fn border_style() -> PopupBorderStyle {
+    *BORDER_STYLE.get_or_init(parse_border_style_from_env)
+}
 
 // 动态注册一个 Objective-C 类，作为 target/action 的处理对象。
 fn ensure_click_handler_class() -> &'static AnyClass {
@@ -40,29 +98,27 @@ fn ensure_click_handler_class() -> &'static AnyClass {
 
 fn configure_popup_window(ns_win: *mut AnyObject) {
     unsafe {
-        // 隐藏标题与三键按钮
-        let _: () = msg_send![ns_win, setTitlebarAppearsTransparent: true];
-        let _: () = msg_send![ns_win, setTitleVisibility: 1u64 /* NSWindowTitleHidden */];
-        // 让内容扩展到标题栏区域（移除顶部内边距）
-        let mask: u64 = msg_send![ns_win, styleMask];
-        let fullsize_bit: u64 = 1u64 << 15; // NSWindowStyleMaskFullSizeContentView
-        let _: () = msg_send![ns_win, setStyleMask: mask | fullsize_bit];
-        // 允许通过背景拖动
-        let _: () = msg_send![ns_win, setMovableByWindowBackground: true];
-
-        // 添加边框（使用内容视图的 CALayer）
-        let content_view: *mut AnyObject = msg_send![ns_win, contentView];
-        if !content_view.is_null() {
-            let _: () = msg_send![content_view, setWantsLayer: true];
-            let layer: *mut AnyObject = msg_send![content_view, layer];
-            if !layer.is_null() {
-                // 边框宽度与颜色（黑色 25% 透明）
-                let _: () = msg_send![layer, setBorderWidth: 1.0f64];
-                let color: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedWhite: 0.0f64, alpha: 0.25f64];
-                let cg: *mut AnyObject = msg_send![color, CGColor];
-                let _: () = msg_send![layer, setBorderColor: cg];
-            }
+        // 使用系统标题栏（可见），避免“看起来被删除”
+        if msg_send![ns_win, respondsToSelector: sel!(setTitlebarAppearsTransparent:)] {
+            let _: () = msg_send![ns_win, setTitlebarAppearsTransparent: false];
         }
+        if msg_send![ns_win, respondsToSelector: sel!(setTitleVisibility:)] {
+            let _: () = msg_send![ns_win, setTitleVisibility: 0u64 /* NSWindowTitleVisible */];
+        }
+        if msg_send![ns_win, respondsToSelector: sel!(styleMask)]
+            && msg_send![ns_win, respondsToSelector: sel!(setStyleMask:)]
+        {
+            let mask: u64 = msg_send![ns_win, styleMask];
+            let fullsize_bit: u64 = 1u64 << 15; // NSWindowStyleMaskFullSizeContentView
+            let cleared = mask & !fullsize_bit; // 不让内容延伸到标题栏
+            let _: () = msg_send![ns_win, setStyleMask: cleared];
+        }
+        // 仅标题栏可拖动
+        if msg_send![ns_win, respondsToSelector: sel!(setMovableByWindowBackground:)] {
+            let _: () = msg_send![ns_win, setMovableByWindowBackground: false];
+        }
+
+        // 边框改由渲染层绘制；此处不再调用 setContentBorderThickness，避免潜在兼容性问题。
 
         // 隐藏标准按钮（关闭、最小化、缩放）
         for i in 0u64..=2u64 {
@@ -71,6 +127,23 @@ fn configure_popup_window(ns_win: *mut AnyObject) {
                 let _: () = msg_send![btn, setHidden: true];
                 let _: () = msg_send![btn, setEnabled: false];
             }
+        }
+
+        // 设置圆角与阴影（安全调用）
+        let cv: *mut AnyObject = msg_send![ns_win, contentView];
+        if !cv.is_null() {
+            let _: () = msg_send![cv, setWantsLayer: true];
+            let layer: *mut AnyObject = msg_send![cv, layer];
+            if !layer.is_null() {
+                // 顶部左右直角：不对内容视图应用圆角
+                let _: () = msg_send![layer, setCornerRadius: 0.0f64];
+                let _: () = msg_send![layer, setMasksToBounds: false];
+            }
+
+        }
+        if msg_send![ns_win, respondsToSelector: sel!(setHasShadow:)] {
+            let style = border_style();
+            let _: () = msg_send![ns_win, setHasShadow: style.shadow];
         }
     }
 }
@@ -108,6 +181,8 @@ pub fn status_item_anchor() -> Option<(f64, f64)> {
     }
 }
 
+//
+
 fn toggle_main_window(sender: *mut AnyObject) {
     let win = NSWINDOW_PTR.load(Ordering::Relaxed);
     if win.is_null() {
@@ -132,6 +207,7 @@ fn toggle_main_window(sender: *mut AnyObject) {
 /// 多次调用将更新现有文字。
 pub fn init_status_bar_text(text: &str) {
     assert!(MainThreadMarker::new().is_some());
+    let _ = BORDER_STYLE.get_or_init(parse_border_style_from_env);
     let bar = NSStatusBar::systemStatusBar();
     // -1.0 等同于 NSVariableStatusItemLength，使用自适应长度
     let item: Retained<NSStatusItem> = bar.statusItemWithLength(-1.0);

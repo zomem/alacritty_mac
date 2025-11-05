@@ -994,6 +994,23 @@ impl Display {
             // Draw rectangles.
             self.renderer.draw_rects(&size_info, &metrics, rects);
 
+            // 额外绘制弹窗边框（仅 macOS）。
+            #[cfg(target_os = "macos")]
+            {
+                let style = crate::macos::status_bar::border_style();
+                let mut border_rects = Vec::with_capacity(4);
+                let bw = style.width.max(0.5); // 边框宽度
+                let w = size_info.width() as f32;
+                let h = size_info.height() as f32;
+                let color = crate::display::color::Rgb::new(style.color.0, style.color.1, style.color.2);
+                let alpha = style.alpha;
+                border_rects.push(RenderRect::new(0.0, 0.0, w, bw, color, alpha)); // 顶部
+                border_rects.push(RenderRect::new(0.0, h - bw, w, bw, color, alpha)); // 底部
+                border_rects.push(RenderRect::new(0.0, 0.0, bw, h, color, alpha)); // 左侧
+                border_rects.push(RenderRect::new(w - bw, 0.0, bw, h, color, alpha)); // 右侧
+                self.renderer.draw_rects(&size_info, &metrics, border_rects);
+            }
+
             // Relay messages to the user.
             let glyph_cache = &mut self.glyph_cache;
             let fg = config.colors.primary.background;
@@ -1011,6 +1028,23 @@ impl Display {
         } else {
             // Draw rectangles.
             self.renderer.draw_rects(&size_info, &metrics, rects);
+
+            // 额外绘制弹窗边框（仅 macOS）。
+            #[cfg(target_os = "macos")]
+            {
+                let style = crate::macos::status_bar::border_style();
+                let mut border_rects = Vec::with_capacity(4);
+                let bw = style.width.max(0.5); // 边框宽度
+                let w = size_info.width() as f32;
+                let h = size_info.height() as f32;
+                let color = crate::display::color::Rgb::new(style.color.0, style.color.1, style.color.2);
+                let alpha = style.alpha;
+                border_rects.push(RenderRect::new(0.0, 0.0, w, bw, color, alpha)); // 顶部
+                border_rects.push(RenderRect::new(0.0, h - bw, w, bw, color, alpha)); // 底部
+                border_rects.push(RenderRect::new(0.0, 0.0, bw, h, color, alpha)); // 左侧
+                border_rects.push(RenderRect::new(w - bw, 0.0, bw, h, color, alpha)); // 右侧
+                self.renderer.draw_rects(&size_info, &metrics, border_rects);
+            }
         }
 
         self.draw_render_timer(config);
