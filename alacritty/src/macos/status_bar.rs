@@ -145,6 +145,21 @@ fn configure_popup_window(ns_win: *mut AnyObject) {
             let style = border_style();
             let _: () = msg_send![ns_win, setHasShadow: style.shadow];
         }
+
+        // 确保窗口在“当前桌面/Space”显示。
+        // 通过设置 NSWindowCollectionBehaviorMoveToActiveSpace | NSWindowCollectionBehaviorTransient。
+        // 位定义参考 AppKit：
+        //  - MoveToActiveSpace = 1 << 1
+        //  - Transient          = 1 << 3
+        if msg_send![ns_win, respondsToSelector: sel!(setCollectionBehavior:)]
+            && msg_send![ns_win, respondsToSelector: sel!(collectionBehavior)]
+        {
+            let existing: u64 = msg_send![ns_win, collectionBehavior];
+            let move_to_active_space: u64 = 1u64 << 1;
+            let transient: u64 = 1u64 << 3;
+            let combined = existing | move_to_active_space | transient;
+            let _: () = msg_send![ns_win, setCollectionBehavior: combined];
+        }
     }
 }
 
