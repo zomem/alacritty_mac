@@ -318,8 +318,8 @@ fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
         // 创建菜单
         let menu: *mut AnyObject = msg_send![class!(NSMenu), new];
 
-        // 新增窗口菜单项
-        let title = NSString::from_str("新增窗口");
+        // 新建窗口菜单项
+        let title = NSString::from_str("新建窗口");
         let empty_key = NSString::from_str("");
         let mi_alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
         let mi: *mut AnyObject = msg_send![
@@ -335,7 +335,7 @@ fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
     }
 }
 
-/// 提供事件代理给状态栏菜单使用（用于“新增窗口”）。
+/// 提供事件代理给状态栏菜单使用（用于“新建窗口”）。
 pub fn set_event_proxy(proxy: EventLoopProxy<Event>) {
     let _ = EVENT_PROXY.set(proxy);
 }

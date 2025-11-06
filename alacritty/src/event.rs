@@ -689,7 +689,7 @@ impl ApplicationHandler<Event> for Processor {
                 }
                 self.windows_shown = show;
             },
-            // 显示全部窗口（用于“新增窗口”后确保所有窗口可见）。
+            // 显示全部窗口（用于“新建窗口”后确保所有窗口可见）。
             (EventType::ShowAllWindows, _) => {
                 #[cfg(target_os = "macos")]
                 {
