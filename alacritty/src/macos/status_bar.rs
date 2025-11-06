@@ -190,12 +190,21 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             }
         }
 
+        // 退出应用
+        extern "C" fn on_quit(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+            unsafe {
+                let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
+                let _: () = msg_send![app, terminate: std::ptr::null::<AnyObject>()];
+            }
+        }
+
         unsafe {
             builder.add_method(sel!(onStatusItemClick:), on_click as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemNewWindow:), on_new_window as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemOpenConfig:), on_open_config as extern "C" fn(_, _, _));
             builder.add_method(sel!(onConfigAddPath:), on_config_add_path as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemOpenSavedPath:), on_open_saved_path as extern "C" fn(_, _, _));
+            builder.add_method(sel!(onStatusItemQuit:), on_quit as extern "C" fn(_, _, _));
         }
 
         let cls = builder.register();
@@ -409,6 +418,22 @@ fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
         ];
         let _: () = msg_send![mi2, setTarget: target];
         let _: () = msg_send![menu, addItem: mi2];
+
+        // 分隔线
+        let sep2: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![menu, addItem: sep2];
+
+        // 退出菜单项
+        let quit_title = NSString::from_str("退出");
+        let miq_alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let miq: *mut AnyObject = msg_send![
+            miq_alloc,
+            initWithTitle: &*quit_title,
+            action: sel!(onStatusItemQuit:),
+            keyEquivalent: &*empty_key
+        ];
+        let _: () = msg_send![miq, setTarget: target];
+        let _: () = msg_send![menu, addItem: miq];
 
         menu
     }
