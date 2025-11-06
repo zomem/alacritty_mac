@@ -385,6 +385,10 @@ impl Processor {
             log::debug!("[macOS] create window: '{}' (num={}, id={:?})", title, num, new_id);
         }
         self.windows.insert(new_id, window_context);
+        #[cfg(not(windows))]
+        if let Some(wc) = self.windows.get_mut(&new_id) {
+            wc.update_title_from_foreground_cwd();
+        }
         #[cfg(target_os = "macos")]
         {
             // 初始窗口置于栈顶。
@@ -436,6 +440,10 @@ impl Processor {
             log::debug!("[macOS] create window: '{}' (num={}, id={:?})", title, num, id);
         }
         self.windows.insert(id, window_context);
+        #[cfg(not(windows))]
+        if let Some(wc) = self.windows.get_mut(&id) {
+            wc.update_title_from_foreground_cwd();
+        }
         #[cfg(target_os = "macos")]
         {
             // 新窗口加入栈顶。
@@ -2253,15 +2261,53 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     self.ctx.display.pending_update.dirty = true;
                 },
                 EventType::Terminal(event) => match event {
-                    TerminalEvent::Title(title) => {
+                    TerminalEvent::Title(_title) => {
                         if !self.ctx.preserve_title && self.ctx.config.window.dynamic_title {
-                            self.ctx.window().set_title(title);
+                            #[cfg(not(windows))]
+                            {
+                                if let Ok(path) =
+                                    crate::daemon::foreground_process_path(self.ctx.master_fd, self.ctx.shell_pid)
+                                {
+                                    let title = path.to_string_lossy().into_owned();
+                                    self.ctx.window().set_title(title);
+                                } else {
+                                    // 回退到原行为（使用终端上报的标题）。
+                                    // 注意：这里 _title 可能包含非目录信息，但作为兜底更安全。
+                                    self.ctx.window().set_title(_title);
+                                }
+                            }
+                            #[cfg(windows)]
+                            {
+                                // Windows 平台保留原逻辑。
+                                self.ctx.window().set_title(_title);
+                            }
                         }
                     },
                     TerminalEvent::ResetTitle => {
                         let window_config = &self.ctx.config.window;
                         if !self.ctx.preserve_title && window_config.dynamic_title {
-                            self.ctx.display.window.set_title(window_config.identity.title.clone());
+                            #[cfg(not(windows))]
+                            {
+                                if let Ok(path) =
+                                    crate::daemon::foreground_process_path(self.ctx.master_fd, self.ctx.shell_pid)
+                                {
+                                    let title = path.to_string_lossy().into_owned();
+                                    self.ctx.display.window.set_title(title);
+                                } else {
+                                    // 获取失败则回退到配置标题。
+                                    self.ctx
+                                        .display
+                                        .window
+                                        .set_title(window_config.identity.title.clone());
+                                }
+                            }
+                            #[cfg(windows)]
+                            {
+                                self.ctx
+                                    .display
+                                    .window
+                                    .set_title(window_config.identity.title.clone());
+                            }
                         }
                     },
                     TerminalEvent::Bell => {
@@ -2383,6 +2429,14 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // Reset the urgency hint when gaining focus.
                         if is_focused {
                             self.ctx.window().set_urgent(false);
+                            // 聚焦时同步窗口标题为当前前台进程工作目录（忽略 dynamic_title/preserve_title）。
+                            #[cfg(not(windows))]
+                            if let Ok(path) =
+                                crate::daemon::foreground_process_path(self.ctx.master_fd, self.ctx.shell_pid)
+                            {
+                                let title = path.to_string_lossy().into_owned();
+                                self.ctx.window().set_title(title);
+                            }
                         }
 
                         self.ctx.update_cursor_blinking();

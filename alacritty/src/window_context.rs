@@ -43,6 +43,8 @@ use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
 use crate::scheduler::Scheduler;
 use crate::{input, renderer};
+#[cfg(not(windows))]
+use crate::daemon::foreground_process_path;
 
 /// Event context for one individual Alacritty window.
 pub struct WindowContext {
@@ -65,6 +67,8 @@ pub struct WindowContext {
     master_fd: RawFd,
     #[cfg(not(windows))]
     shell_pid: u32,
+    #[cfg(not(windows))]
+    last_cwd_title: Option<String>,
     window_config: ParsedOptions,
     config: Rc<UiConfig>,
 }
@@ -169,13 +173,20 @@ impl WindowContext {
 
     /// Create a new terminal window context.
     fn new(
-        display: Display,
+        mut display: Display,
         config: Rc<UiConfig>,
         options: WindowOptions,
         proxy: EventLoopProxy<Event>,
     ) -> Result<Self, Box<dyn Error>> {
         let mut pty_config = config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
+
+        // 若明确指定了工作目录，优先立即用它设置窗口标题，确保“新开窗口的第一时间”就显示目录。
+        #[cfg(not(windows))]
+        if let Some(ref dir) = pty_config.working_directory {
+            let title = dir.to_string_lossy().into_owned();
+            display.window.set_title(title);
+        }
 
         let preserve_title = options.window_identity.title.is_some();
 
@@ -206,6 +217,15 @@ impl WindowContext {
         let master_fd = pty.file().as_raw_fd();
         #[cfg(not(windows))]
         let shell_pid = pty.child().id();
+
+        // 如未指定工作目录，尝试用当前前台进程工作目录设置标题（macOS/Unix）。
+        #[cfg(not(windows))]
+        if pty_config.working_directory.is_none() {
+            if let Ok(path) = foreground_process_path(master_fd, shell_pid) {
+                let title = path.to_string_lossy().into_owned();
+                display.window.set_title(title);
+            }
+        }
 
         // Create the pseudoterminal I/O loop.
         //
@@ -242,6 +262,8 @@ impl WindowContext {
             master_fd,
             #[cfg(not(windows))]
             shell_pid,
+            #[cfg(not(windows))]
+            last_cwd_title: Default::default(),
             config,
             notifier: Notifier(loop_tx),
             cursor_blink_timed_out: Default::default(),
@@ -257,6 +279,18 @@ impl WindowContext {
             touch: Default::default(),
             dirty: Default::default(),
         })
+    }
+
+    /// 强制从前台进程工作目录更新标题（macOS/Unix）。
+    #[cfg(not(windows))]
+    pub fn update_title_from_foreground_cwd(&mut self) {
+        if let Ok(path) = foreground_process_path(self.master_fd, self.shell_pid) {
+            let title = path.to_string_lossy().into_owned();
+            if self.last_cwd_title.as_deref() != Some(&title) {
+                self.display.window.set_title(title.clone());
+                self.last_cwd_title = Some(title);
+            }
+        }
     }
 
     /// Update the terminal window to the latest config.
