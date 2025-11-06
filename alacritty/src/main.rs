@@ -192,6 +192,9 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
         status_bar::set_event_proxy(window_event_loop.create_proxy());
         // 创建全局主状态栏项，确保即使无窗口也能从菜单栏新建窗口
         status_bar::create_global_status_item("Alacritty");
+        // 注入事件代理给热键模块，并按偏好初始化热键
+        crate::macos::hotkey::set_event_proxy(window_event_loop.create_proxy());
+        crate::macos::hotkey::init_from_prefs();
     }
 
     // Create the IPC socket listener.

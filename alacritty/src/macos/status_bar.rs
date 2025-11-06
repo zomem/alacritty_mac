@@ -3,6 +3,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Sel, Bool};
 use objc2_foundation::{NSString, NSRect, NSPoint, NSSize, NSUserDefaults};
 use objc2_app_kit::{NSApplication, NSStatusBar, NSStatusItem, NSMenu, NSMenuItem};
+use crate::macos::hotkey;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, AtomicIsize, Ordering};
 use std::cell::RefCell;
@@ -254,6 +255,30 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                     let _ = proxy.send_event(Event::new(EventType::CreateWindow(opts), None));
                     let _ = proxy.send_event(Event::new(EventType::ShowAllWindows, None));
                 }
+            }
+        }
+
+        // 配置窗口：录制到组合快捷键
+        extern "C" fn on_config_hotkey_recorded(_this: &AnyObject, _sel: Sel, sender: *mut AnyObject) {
+            unsafe {
+                if sender.is_null() { return; }
+                let tag_val: i64 = msg_send![sender, tag];
+                // tag: 高32位=mods, 低32位=key_code；-1 表示禁用
+                if tag_val < 0 {
+                    super::status_bar::set_saved_hotkey_all(-1, 0, "禁用");
+                    crate::macos::hotkey::register_hotkey_combo(-1, 0);
+                    return;
+                }
+                let code = (tag_val & 0xFFFF_FFFF) as i64;
+                let mods_i = ((tag_val >> 32) & 0xFFFF_FFFF) as i64;
+                let text_obj: *mut AnyObject = msg_send![sender, stringValue];
+                let display = if !text_obj.is_null() {
+                    let c_ptr: *const std::ffi::c_char = msg_send![text_obj, UTF8String];
+                    if !c_ptr.is_null() { std::ffi::CStr::from_ptr(c_ptr).to_string_lossy().into_owned() } else { String::new() }
+                } else { String::new() };
+                super::status_bar::set_saved_hotkey_all(code, mods_i, &display);
+                eprintln!("[hotkey] commit tag={} -> code={} mods={}", tag_val, code, mods_i);
+                hotkey::register_hotkey_combo(code, mods_i as u32);
             }
         }
 
@@ -509,6 +534,7 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             builder.add_method(sel!(onConfigAddPath:), on_config_add_path as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemOpenSavedPath:), on_open_saved_path as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemQuit:), on_quit as extern "C" fn(_, _, _));
+            builder.add_method(sel!(onConfigHotkeyRecorded:), on_config_hotkey_recorded as extern "C" fn(_, _, _));
 
             // 表格数据源/委托
             builder.add_method(sel!(numberOfRowsInTableView:), number_of_rows_in_table as extern "C" fn(_, _, _) -> isize);
@@ -555,6 +581,110 @@ fn ensure_path_tableview_class() -> &'static AnyClass {
 
         unsafe {
             builder.add_method(sel!(resetCursorRects), reset_cursor_rects as extern "C" fn(_, _));
+        }
+
+        let cls = builder.register();
+        CLS = Some(cls);
+    });
+
+    unsafe { CLS.unwrap() }
+}
+
+// 自定义快捷键录制文本控件：点击后成为第一响应者，捕获下一次按键作为组合键。
+fn ensure_hotkey_recorder_class() -> &'static AnyClass {
+    use objc2::declare::ClassBuilder;
+    use std::ffi::CString;
+
+    static mut CLS: Option<&'static AnyClass> = None;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let name = CString::new("AlacrittyHotkeyRecorderField").unwrap();
+        let mut builder = ClassBuilder::new(name.as_c_str(), class!(NSTextField))
+            .expect("create recorder class");
+
+        extern "C" fn accepts_first_responder(_this: &AnyObject, _sel: Sel) -> Bool { Bool::YES }
+
+        extern "C" fn mouse_down(this: &AnyObject, _sel: Sel, _event: *mut AnyObject) {
+            unsafe {
+                let win: *mut AnyObject = msg_send![this, window];
+                if !win.is_null() {
+                    let _: Bool = msg_send![win, makeFirstResponder: this];
+                }
+                let tip = NSString::from_str("录制中… 按下组合键");
+                let _: () = msg_send![this, setStringValue: &*tip];
+            }
+        }
+
+        extern "C" fn key_down(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
+            unsafe {
+                if event.is_null() { return; }
+                // 取修饰与 keyCode
+                let ns_flags: u64 = msg_send![event, modifierFlags];
+                let carbon_mods = crate::macos::hotkey::nsflags_to_carbon_modifiers(ns_flags);
+                let key_code_u: u16 = msg_send![event, keyCode];
+                let key_code = key_code_u as i64;
+                // ESC 视为禁用
+                if key_code_u == 53 {
+                    let _: () = msg_send![this, setTag: -1i64];
+                    let s = NSString::from_str("禁用");
+                    let _: () = msg_send![this, setStringValue: &*s];
+                    let target: *mut AnyObject = msg_send![this, target];
+                    let action: Sel = msg_send![this, action];
+                    if !target.is_null() { let _: Bool = msg_send![this, sendAction: action, to: target]; }
+                    let win: *mut AnyObject = msg_send![this, window];
+                    if !win.is_null() { let _: Bool = msg_send![win, makeFirstResponder: std::ptr::null::<AnyObject>()]; }
+                    return;
+                }
+                // 忽略纯修饰键
+                let is_mod_key = matches!(key_code_u, 54 | 55 | 56 | 58 | 59 | 60 | 61 | 62 | 57);
+                if is_mod_key { return; }
+
+                // 构造展示字符串：⌘⇧⌥⌃ + 字符
+                let chars_obj: *mut AnyObject = msg_send![event, charactersIgnoringModifiers];
+                let mut key_text = String::new();
+                if !chars_obj.is_null() {
+                    let c_ptr: *const std::ffi::c_char = msg_send![chars_obj, UTF8String];
+                    if !c_ptr.is_null() {
+                        key_text = std::ffi::CStr::from_ptr(c_ptr).to_string_lossy().into_owned();
+                    }
+                }
+                if key_text.is_empty() { key_text = format!("keycode:{}", key_code); }
+                let mut disp = String::new();
+                // NS flags bits used already; derive display from them
+                const NS_MOD_SHIFT: u64 = 1 << 17;
+                const NS_MOD_CTRL: u64 = 1 << 18;
+                const NS_MOD_ALT: u64 = 1 << 19;
+                const NS_MOD_CMD: u64 = 1 << 20;
+                if ns_flags & NS_MOD_CMD != 0 { disp.push('⌘'); }
+                if ns_flags & NS_MOD_SHIFT != 0 { disp.push('⇧'); }
+                if ns_flags & NS_MOD_ALT != 0 { disp.push('⌥'); }
+                if ns_flags & NS_MOD_CTRL != 0 { disp.push('⌃'); }
+                // Uppercase letter for visibility
+                disp.push_str(&key_text.to_uppercase());
+
+                // 写入控件的 tag（高32位=mods，低32位=key_code）并更新文本
+                let combined: i64 = ((carbon_mods as i64) << 32) | ((key_code as i64) & 0xFFFF_FFFF);
+                let _: () = msg_send![this, setTag: combined];
+                let ns_disp = NSString::from_str(&disp);
+                let _: () = msg_send![this, setStringValue: &*ns_disp];
+
+                // 回调 target/action
+                let target: *mut AnyObject = msg_send![this, target];
+                let action: Sel = msg_send![this, action];
+                if !target.is_null() {
+                    let _: Bool = msg_send![this, sendAction: action, to: target];
+                }
+
+                // 结束录制
+                let win: *mut AnyObject = msg_send![this, window];
+                if !win.is_null() { let _: Bool = msg_send![win, makeFirstResponder: std::ptr::null::<AnyObject>()]; }
+            }
+        }
+
+        unsafe {
+            builder.add_method(sel!(acceptsFirstResponder), accepts_first_responder as extern "C" fn(_, _) -> Bool);
+            builder.add_method(sel!(mouseDown:), mouse_down as extern "C" fn(_, _, _));
+            builder.add_method(sel!(keyDown:), key_down as extern "C" fn(_, _, _));
         }
 
         let cls = builder.register();
@@ -1012,6 +1142,73 @@ fn set_saved_paths_string(s: &str) {
 
 // 路径展示遵循全局工具：crate::path_util::shorten_home
 
+/// 读取/保存全局快捷键（仅保存 keyCode，-1 表示禁用）。
+pub fn get_saved_hotkey_code() -> i64 {
+    unsafe {
+        let defs = NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("AlacrittyGlobalHotkeyKeyCode");
+        if msg_send![&*defs, respondsToSelector: sel!(integerForKey:)] {
+            let v: i64 = msg_send![&*defs, integerForKey: &*key];
+            return v;
+        }
+        -1
+    }
+}
+
+pub fn set_saved_hotkey_code(code: i64) {
+    unsafe {
+        let defs = NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("AlacrittyGlobalHotkeyKeyCode");
+        let _: () = msg_send![&*defs, setInteger: code, forKey: &*key];
+        let _: bool = msg_send![&*defs, synchronize];
+    }
+}
+
+/// 读取/保存全局快捷键的修饰位（Carbon 位编码）。
+pub fn get_saved_hotkey_modifiers() -> i64 {
+    unsafe {
+        let defs = NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("AlacrittyGlobalHotkeyModifiers");
+        if msg_send![&*defs, respondsToSelector: sel!(integerForKey:)] {
+            let v: i64 = msg_send![&*defs, integerForKey: &*key];
+            return v;
+        }
+        0
+    }
+}
+
+pub fn set_saved_hotkey_modifiers(mods: i64) {
+    unsafe {
+        let defs = NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("AlacrittyGlobalHotkeyModifiers");
+        let _: () = msg_send![&*defs, setInteger: mods, forKey: &*key];
+        let _: bool = msg_send![&*defs, synchronize];
+    }
+}
+
+pub fn get_saved_hotkey_display() -> String {
+    unsafe {
+        let defs = NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("AlacrittyGlobalHotkeyDisplay");
+        let s_obj: *mut AnyObject = msg_send![&*defs, stringForKey: &*key];
+        if s_obj.is_null() { return String::new(); }
+        let c_ptr: *const std::ffi::c_char = msg_send![s_obj, UTF8String];
+        if c_ptr.is_null() { String::new() } else { std::ffi::CStr::from_ptr(c_ptr).to_string_lossy().into_owned() }
+    }
+}
+
+pub fn set_saved_hotkey_all(code: i64, mods: i64, display: &str) {
+    set_saved_hotkey_code(code);
+    set_saved_hotkey_modifiers(mods);
+    unsafe {
+        let defs = NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("AlacrittyGlobalHotkeyDisplay");
+        let val = NSString::from_str(display);
+        let _: () = msg_send![&*defs, setObject: &*val, forKey: &*key];
+        let _: bool = msg_send![&*defs, synchronize];
+    }
+}
+
 fn update_config_table() {
     unsafe {
         let table = CONFIG_TABLE_PTR.load(Ordering::Relaxed);
@@ -1175,6 +1372,7 @@ pub unsafe fn open_config_window() {
     let pad: f64 = 16.0;
     let btn_h: f64 = 28.0;
     let btn_w: f64 = 28.0; // 使用方形小按钮呈现“＋/－”
+    let hk_h: f64 = 24.0;  // 顶部“全局快捷键”行高
 
     // 计算布局：按钮在底部左侧（Finder 风格）
     let btn_x = 16.0f64;
@@ -1190,7 +1388,8 @@ pub unsafe fn open_config_window() {
     // 底部预留按钮区
     let scroll_y = pad + btn_h + pad;
     let scroll_w = cv_frame.size.width - 2.0 * pad;
-    let scroll_h = cv_frame.size.height - (3.0 * pad) - btn_h;
+    // 额外为顶部“全局快捷键”留出 hk_h + pad
+    let scroll_h = cv_frame.size.height - (3.0 * pad) - btn_h - (hk_h + pad);
     let scroll_frame = NSRect { origin: NSPoint { x: scroll_x, y: scroll_y }, size: NSSize { width: scroll_w, height: scroll_h } };
 
     // 按钮：＋ / －
@@ -1312,8 +1511,56 @@ pub unsafe fn open_config_window() {
     }
     let _: () = msg_send![scroll, setDocumentView: table];
 
+    // 顶部：全局快捷键 录制
+    let label_frame = NSRect { origin: NSPoint { x: pad, y: cv_frame.size.height - pad - hk_h }, size: NSSize { width: 90.0, height: hk_h } };
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: label_frame];
+    let ltext = NSString::from_str("全局快捷键");
+    let _: () = msg_send![label, setStringValue: &*ltext];
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    if msg_send![label, respondsToSelector: sel!(setDrawsBackground:)] {
+        let _: () = msg_send![label, setDrawsBackground: false];
+    }
+    if msg_send![label, respondsToSelector: sel!(setAutoresizingMask:)] {
+        // 顶部固定：底部距父视图的间距可伸缩（MinYMargin），右侧间距可伸缩（MaxXMargin），宽度不自适应
+        // 这样在窗口拉伸时，始终贴顶且保持与左侧距离不变、宽度不变
+        // NSViewMinYMargin = 1<<3, NSViewMaxXMargin = 1<<2
+        let mask: u64 = (1u64 << 3) | (1u64 << 2);
+        let _: () = msg_send![label, setAutoresizingMask: mask];
+    }
+
+    // 录制区：自定义 TextField
+    let rec_x = pad + 90.0 + 8.0;
+    let rec_w = 220.0;
+    let rec_frame = NSRect { origin: NSPoint { x: rec_x, y: cv_frame.size.height - pad - hk_h + 1.0 }, size: NSSize { width: rec_w, height: hk_h } };
+    let rec_cls = ensure_hotkey_recorder_class();
+    let recorder: *mut AnyObject = msg_send![rec_cls, alloc];
+    let recorder: *mut AnyObject = msg_send![recorder, initWithFrame: rec_frame];
+    // 外观
+    let _: () = msg_send![recorder, setBezeled: true];
+    let _: () = msg_send![recorder, setEditable: false];
+    let _: () = msg_send![recorder, setSelectable: false];
+    if msg_send![recorder, respondsToSelector: sel!(setAutoresizingMask:)] {
+        // 同上：顶部固定且贴左，宽度不自适应
+        // NSViewMinYMargin | NSViewMaxXMargin
+        let mask: u64 = (1u64 << 3) | (1u64 << 2);
+        let _: () = msg_send![recorder, setAutoresizingMask: mask];
+    }
+    // 目标与响应：录制完成后回调 handler
+    let _: () = msg_send![recorder, setTarget: &*handler];
+    let _: () = msg_send![recorder, setAction: sel!(onConfigHotkeyRecorded:)];
+    // 初始显示
+    let saved_disp = get_saved_hotkey_display();
+    let init_text = if saved_disp.is_empty() { "点击并按下组合键".to_string() } else { saved_disp };
+    let init_ns = NSString::from_str(&init_text);
+    let _: () = msg_send![recorder, setStringValue: &*init_ns];
+
     // 添加子视图
     let _: () = msg_send![content_view, addSubview: scroll];
+    let _: () = msg_send![content_view, addSubview: label];
+    let _: () = msg_send![content_view, addSubview: recorder];
     let _: () = msg_send![content_view, addSubview: button_plus];
     let _: () = msg_send![content_view, addSubview: button_minus];
     let _: () = msg_send![content_view, addSubview: button_sep];

@@ -5,6 +5,7 @@ pub mod locale;
 pub mod proc;
 pub mod status_bar;
 pub mod activation_guard;
+pub mod hotkey;
 
 pub fn disable_autofill() {
     unsafe {

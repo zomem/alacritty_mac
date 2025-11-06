@@ -4,6 +4,10 @@ use std::path::Path;
 use std::process::Command;
 
 use gl_generator::{Api, Fallbacks, GlobalGenerator, Profile, Registry};
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::fs;
 
 fn main() {
     let mut version = String::from(env!("CARGO_PKG_VERSION"));
@@ -23,6 +27,7 @@ fn main() {
     .write_bindings(GlobalGenerator, &mut file)
     .unwrap();
 
+    // 如需编译额外 Objective-C 辅助代码，可在此扩展（当前未启用）。
     #[cfg(windows)]
     embed_resource::compile("./windows/alacritty.rc", embed_resource::NONE)
         .manifest_required()
