@@ -25,6 +25,7 @@ use {
     objc2::MainThreadMarker,
     objc2::runtime::AnyObject,
     objc2_app_kit::{NSApplication, NSColorSpace, NSView},
+    objc2_foundation::{NSPoint, NSRect, NSSize},
     winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
 };
 
@@ -220,6 +221,10 @@ impl Window {
                         let combined = existing | move_to_active_space | transient;
                         let _: () = objc2::msg_send![ns_ptr, setCollectionBehavior: combined];
                     }
+
+                    // 使用系统窗口动画行为，避免自定义动画带来的卡顿/延迟。
+                    // NSWindowAnimationBehaviorDocumentWindow = 3
+                    let _: () = objc2::msg_send![ns_ptr, setAnimationBehavior: 3i64];
                 },
                 _ => {}
             }
@@ -302,6 +307,7 @@ impl Window {
                     let combined = existing | move_to_active_space | transient;
                     let _: () = objc2::msg_send![ns_ptr, setCollectionBehavior: combined];
                 }
+                // 使用系统动画行为；直接置前即可，避免手动淡入/缩放导致卡顿。
                 let _: () = objc2::msg_send![ns_ptr, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
             },
             _ => {}
@@ -319,6 +325,7 @@ impl Window {
                 let ns_ptr = (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
                     as *mut objc2_app_kit::NSWindow)
                     .cast::<AnyObject>();
+                // 使用系统动画行为；直接隐藏，避免延迟。
                 let _: () = objc2::msg_send![ns_ptr, orderOut: std::ptr::null::<AnyObject>()];
             },
             _ => {}
@@ -346,6 +353,7 @@ impl Window {
                     let combined = existing | move_to_active_space | transient;
                     let _: () = objc2::msg_send![ns_ptr, setCollectionBehavior: combined];
                 }
+                // 使用系统动画行为；仅前置显示（不设为 key）。
                 let _: () = objc2::msg_send![ns_ptr, orderFront: std::ptr::null::<AnyObject>()];
             },
             _ => {}
