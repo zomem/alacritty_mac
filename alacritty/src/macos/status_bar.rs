@@ -236,9 +236,13 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                 let ident = NSString::from_str("PathCell");
                 let mut cell: *mut AnyObject = msg_send![table, makeViewWithIdentifier: &*ident, owner: table];
                 if cell.is_null() {
-                    cell = msg_send![class!(NSTableCellView), alloc];
+                    let cell_cls = ensure_path_cellview_class();
+                    cell = msg_send![cell_cls, alloc];
                     cell = msg_send![cell, initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 10.0, height: 10.0 } }];
                     let _: () = msg_send![cell, setIdentifier: &*ident];
+                    if msg_send![cell, respondsToSelector: sel!(setAutoresizesSubviews:)] {
+                        let _: () = msg_send![cell, setAutoresizesSubviews: true];
+                    }
 
                     // 文本
                     let text: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -246,6 +250,11 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                     let _: () = msg_send![text, setBordered: false];
                     let _: () = msg_send![text, setEditable: false];
                     let _: () = msg_send![text, setBezeled: false];
+                    // 仅随宽度伸缩；垂直居中由 CellView.layout 统一处理
+                    if msg_send![text, respondsToSelector: sel!(setAutoresizingMask:)] {
+                        let mask: u64 = (1u64 << 1); // NSViewWidthSizable
+                        let _: () = msg_send![text, setAutoresizingMask: mask];
+                    }
                     if msg_send![text, respondsToSelector: sel!(setDrawsBackground:)] {
                         let _: () = msg_send![text, setDrawsBackground: false];
                     }
@@ -268,24 +277,15 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                     let _: () = msg_send![cell, addSubview: text];
                 }
 
-                // 更新布局
-                let h: f64 = msg_send![table, rowHeight];
-                let table_frame: NSRect = msg_send![table, frame];
-                let pad_y = ((h - 18.0).max(0.0)) / 2.0;
-                let left_pad = 8.0f64;
-                let right_pad = 8.0f64;
-                let text_x = left_pad;
-                // 文本占满整行（右侧仅留 padding）
-                let text_w = (table_frame.size.width - left_pad - right_pad).max(30.0);
-
+                // 更新内容，布局交由自定义 CellView 处理
                 let text: *mut AnyObject = msg_send![cell, viewWithTag: 1002isize];
                 if !text.is_null() {
-                    let _: () = msg_send![text, setFrame: NSRect { origin: NSPoint { x: text_x, y: pad_y }, size: NSSize { width: text_w, height: 18.0 } }];
                     let ns = NSString::from_str(&text_str);
                     let _: () = msg_send![text, setStringValue: &*ns];
                 }
-
-                println!("[配置] 布局 row={} text_w={:.1}", row, text_w);
+                if msg_send![cell, respondsToSelector: sel!(setNeedsLayout:)] {
+                    let _: () = msg_send![cell, setNeedsLayout: true];
+                }
 
                 cell
             }
@@ -461,6 +461,51 @@ fn ensure_path_tableview_class() -> &'static AnyClass {
 
         unsafe {
             builder.add_method(sel!(resetCursorRects), reset_cursor_rects as extern "C" fn(_, _));
+        }
+
+        let cls = builder.register();
+        CLS = Some(cls);
+    });
+
+    unsafe { CLS.unwrap() }
+}
+
+
+// 自定义 NSTableCellView：在 layout 阶段将文本视图垂直居中并设置左右内边距
+fn ensure_path_cellview_class() -> &'static AnyClass {
+    use objc2::declare::ClassBuilder;
+    use std::ffi::CString;
+
+    static mut CLS: Option<&'static AnyClass> = None;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let name = CString::new("AlacrittyPathCellView").unwrap();
+        let mut builder = ClassBuilder::new(name.as_c_str(), class!(NSTableCellView))
+            .expect("create table cell view subclass");
+
+        extern "C" fn layout(this: &AnyObject, _sel: Sel) {
+            unsafe {
+                let bounds: NSRect = msg_send![this, bounds];
+                let h = bounds.size.height;
+                let w = bounds.size.width;
+                let left_pad: f64 = 8.0;
+                let right_pad: f64 = 8.0;
+                let text_h: f64 = 18.0;
+                let pad_y = ((h - text_h).max(0.0)) / 2.0;
+                let flipped: Bool = msg_send![this, isFlipped];
+                let is_flipped = flipped == Bool::YES;
+                let text_y = if is_flipped { pad_y } else { h - text_h - pad_y };
+                let text_w = (w - left_pad - right_pad).max(30.0);
+
+                let text: *mut AnyObject = msg_send![this, viewWithTag: 1002isize];
+                if !text.is_null() {
+                    let _: () = msg_send![text, setFrame: NSRect { origin: NSPoint { x: left_pad, y: text_y }, size: NSSize { width: text_w, height: text_h } }];
+                }
+            }
+        }
+
+        unsafe {
+            builder.add_method(sel!(layout), layout as extern "C" fn(_, _));
         }
 
         let cls = builder.register();
@@ -850,6 +895,9 @@ fn update_config_table() {
         let table = CONFIG_TABLE_PTR.load(Ordering::Relaxed);
         if table.is_null() { return; }
         let _: () = msg_send![table, reloadData];
+        if msg_send![table, respondsToSelector: sel!(sizeLastColumnToFit)] {
+            let _: () = msg_send![table, sizeLastColumnToFit];
+        }
         // 触发重置光标区域
         if msg_send![table, respondsToSelector: sel!(resetCursorRects)] {
             let _: () = msg_send![table, resetCursorRects];
@@ -950,6 +998,9 @@ pub unsafe fn open_config_window() {
     // 内容视图
     let content_view: *mut AnyObject = msg_send![win, contentView];
     if content_view.is_null() { return; }
+    if msg_send![content_view, respondsToSelector: sel!(setAutoresizesSubviews:)] {
+        let _: () = msg_send![content_view, setAutoresizesSubviews: true];
+    }
     let cv_frame: NSRect = msg_send![content_view, frame];
     let pad: f64 = 16.0;
     let btn_h: f64 = 28.0;
@@ -980,6 +1031,12 @@ pub unsafe fn open_config_window() {
     let _: () = msg_send![button_plus, setTitle: &*btn_title_plus];
     let _: () = msg_send![button_plus, setTarget: &*handler];
     let _: () = msg_send![button_plus, setAction: sel!(onConfigAddPath:)];
+    // 固定在左下角：Flexible 右/上边距
+    if msg_send![button_plus, respondsToSelector: sel!(setAutoresizingMask:)] {
+        // NSViewMaxXMargin | NSViewMaxYMargin
+        let mask: u64 = (1u64 << 2) | (1u64 << 5);
+        let _: () = msg_send![button_plus, setAutoresizingMask: mask];
+    }
 
     // － 按钮（移除选中）
     let btn_title_minus = NSString::from_str("－");
@@ -988,18 +1045,47 @@ pub unsafe fn open_config_window() {
     let _: () = msg_send![button_minus, setTitle: &*btn_title_minus];
     let _: () = msg_send![button_minus, setTarget: &*handler];
     let _: () = msg_send![button_minus, setAction: sel!(onConfigRemoveSelected:)];
+    if msg_send![button_minus, respondsToSelector: sel!(setAutoresizingMask:)] {
+        // NSViewMaxXMargin | NSViewMaxYMargin
+        let mask: u64 = (1u64 << 2) | (1u64 << 5);
+        let _: () = msg_send![button_minus, setAutoresizingMask: mask];
+    }
 
     // 滚动 + 表格视图显示路径列表
     let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
     let scroll: *mut AnyObject = msg_send![scroll, initWithFrame: scroll_frame];
+    // 让滚动区域随窗口变化而自适应宽高
+    if msg_send![scroll, respondsToSelector: sel!(setAutoresizingMask:)] {
+        // NSViewWidthSizable | NSViewHeightSizable
+        let mask: u64 = (1u64 << 1) | (1u64 << 4);
+        let _: () = msg_send![scroll, setAutoresizingMask: mask];
+    }
     let table_cls = ensure_path_tableview_class();
     let table: *mut AnyObject = msg_send![table_cls, alloc];
     let table: *mut AnyObject = msg_send![table, initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: scroll_w, height: scroll_h } }];
+    if msg_send![table, respondsToSelector: sel!(setAutoresizingMask:)] {
+        // NSViewWidthSizable | NSViewHeightSizable
+        let mask: u64 = (1u64 << 1) | (1u64 << 4);
+        let _: () = msg_send![table, setAutoresizingMask: mask];
+    }
     let col: *mut AnyObject = msg_send![class!(NSTableColumn), alloc];
     let identifier = NSString::from_str("PathColumn");
     let col: *mut AnyObject = msg_send![col, initWithIdentifier: &*identifier];
     let _: () = msg_send![col, setWidth: scroll_w];
+    // 让唯一列跟随表格宽度自动调整
+    if msg_send![col, respondsToSelector: sel!(setResizingMask:)] {
+        // NSTableColumnAutoresizingMask = 1
+        let _: () = msg_send![col, setResizingMask: 1u64];
+    }
+    if msg_send![table, respondsToSelector: sel!(setColumnAutoresizingStyle:)] {
+        // 使用“最后一列自适应”策略更符合单列列表
+        // NSTableViewLastColumnOnlyAutoresizingStyle 的值在 0..4 之间，这里取 4 以覆盖该常量
+        let _: () = msg_send![table, setColumnAutoresizingStyle: 4u64];
+    }
     let _: () = msg_send![table, addTableColumn: col];
+    if msg_send![table, respondsToSelector: sel!(sizeLastColumnToFit)] {
+        let _: () = msg_send![table, sizeLastColumnToFit];
+    }
     // 隐藏表头
     let _: () = msg_send![table, setHeaderView: std::ptr::null::<AnyObject>()];
     // 行背景：交替颜色显示
