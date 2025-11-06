@@ -106,6 +106,15 @@ pub struct Processor {
     /// macOS: 抑制自动隐藏的截止时间（用于刚显示后的瞬时防抖）。
     #[cfg(target_os = "macos")]
     suppress_auto_hide_until: Option<Instant>,
+    /// macOS: 在恢复层级后，短时间内忽略由系统触发的 Focus(true) 导致的顶部重排，避免污染记录。
+    #[cfg(target_os = "macos")]
+    suppress_focus_reorder_until: Option<Instant>,
+    /// macOS: 记录窗口的层级顺序（从底到顶）。
+    #[cfg(target_os = "macos")]
+    window_z_order: Vec<WindowId>,
+    /// macOS: 上一轮轮询时应用是否处于激活状态（用于检测激活边沿）。
+    #[cfg(target_os = "macos")]
+    app_was_active: bool,
 }
 
 impl Processor {
@@ -154,7 +163,201 @@ impl Processor {
             pending_auto_hide_eval: false,
             #[cfg(target_os = "macos")]
             suppress_auto_hide_until: None,
+            #[cfg(target_os = "macos")]
+            window_z_order: Vec::new(),
+            #[cfg(target_os = "macos")]
+            app_was_active: false,
+            #[cfg(target_os = "macos")]
+            suppress_focus_reorder_until: None,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    /// 读取 AppKit 中当前窗口的真实前后顺序，并更新为“自底向顶”的记录。
+    ///
+    /// 说明：仅记录本进程的 Alacritty 窗口；若有新窗口尚未进入 `orderedWindows`，
+    /// 将保持既有记录的顺序不变。
+    fn capture_current_z_order_from_appkit(&mut self) {
+        use objc2::{class, msg_send};
+        use objc2::MainThreadMarker;
+        use objc2::runtime::AnyObject;
+        use objc2_app_kit::NSApplication;
+
+        if MainThreadMarker::new().is_none() {
+            // 理论上此函数仅在主线程被调用；若不是主线程则放弃更新，避免崩溃。
+            return;
+        }
+
+        // 建立 windowNumber -> WindowId 的映射，便于从 AppKit 序列映射回我们的窗口。
+        let mut id_by_number = std::collections::HashMap::<i64, winit::window::WindowId>::new();
+        for (id, wc) in self.windows.iter() {
+            let num = wc.display.window.window_number();
+            if num != 0 { id_by_number.insert(num, *id); }
+        }
+
+        unsafe {
+            let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
+            let ordered: *mut AnyObject = msg_send![app, orderedWindows]; // NSArray<NSWindow*>
+            if ordered.is_null() { return; }
+
+            // AppKit 文档：orderedWindows 按“前→后”排序。
+            let count: usize = msg_send![ordered, count];
+            let mut front_to_back_ids: Vec<winit::window::WindowId> = Vec::with_capacity(count);
+            for i in 0..count {
+                let win: *mut AnyObject = msg_send![ordered, objectAtIndex: i];
+                if win.is_null() { continue; }
+                let num: i64 = msg_send![win, windowNumber];
+                if let Some(id) = id_by_number.get(&num) {
+                    front_to_back_ids.push(*id);
+                }
+            }
+
+            // 转换为“自底向顶”的向量。
+            if !front_to_back_ids.is_empty() {
+                front_to_back_ids.reverse();
+                log::debug!("[macOS] capture z-order (bottom->top): {:?}", front_to_back_ids);
+                self.window_z_order = front_to_back_ids;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn debug_log_recorded_order(&self, tag: &str, seq: &[WindowId]) {
+        let mut parts: Vec<String> = Vec::new();
+        for wid in seq.iter() {
+            if let Some(wc) = self.windows.get(wid) {
+                let title = wc.display.window.title().to_string();
+                let num = wc.display.window.window_number();
+                parts.push(format!("{}(num={}, id={:?})", title, num, wid));
+            } else {
+                parts.push(format!("<unknown id={:?}>", wid));
+            }
+        }
+        log::debug!("[macOS] {tag}: {}", parts.join(" -> "));
+    }
+
+    #[cfg(target_os = "macos")]
+    /// 使用当前前台窗口作为“最近置顶”的来源，将其移动到记录序列末尾。
+    /// 优先使用 `keyWindow`；若不可用，再从 `[NSApp orderedWindows]` 中选择最前的本进程窗口。
+    /// 仅调整顶部，不改变其余相对顺序。
+    fn bump_top_from_key_window(&mut self) {
+        use objc2::{class, msg_send};
+        use objc2::MainThreadMarker;
+        use objc2::runtime::AnyObject;
+        use objc2_app_kit::NSApplication;
+
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+
+        // 建立 windowNumber -> WindowId 映射
+        let mut id_by_number = std::collections::HashMap::<i64, winit::window::WindowId>::new();
+        for (id, wc) in self.windows.iter() {
+            let num = wc.display.window.window_number();
+            if num != 0 { id_by_number.insert(num, *id); }
+        }
+
+        unsafe {
+            let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
+
+            // 1) 尝试 keyWindow
+            let mut candidate: Option<winit::window::WindowId> = {
+                let key_win: *mut AnyObject = msg_send![app, keyWindow];
+                if !key_win.is_null() {
+                    let num: i64 = msg_send![key_win, windowNumber];
+                    id_by_number.get(&num).copied()
+                } else { None }
+            };
+
+            // 2) 回退：从 orderedWindows 选择最前的“本进程窗口”
+            if candidate.is_none() {
+                let ordered: *mut AnyObject = msg_send![app, orderedWindows];
+                if !ordered.is_null() {
+                    let count: usize = msg_send![ordered, count];
+                    for i in 0..count {
+                        let win: *mut AnyObject = msg_send![ordered, objectAtIndex: i];
+                        if win.is_null() { continue; }
+                        let num: i64 = msg_send![win, windowNumber];
+                        if let Some(id) = id_by_number.get(&num) {
+                            candidate = Some(*id);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(wid) = candidate {
+                if self.window_z_order.last().copied() != Some(wid) {
+                    self.window_z_order.retain(|w| *w != wid);
+                    self.window_z_order.push(wid);
+                    if let Some(wc) = self.windows.get(&wid) {
+                        log::debug!(
+                            "[macOS] bump top -> {} (num={}, id={:?})",
+                            wc.display.window.title(),
+                            wc.display.window.window_number(),
+                            wid
+                        );
+                    } else {
+                        log::debug!("[macOS] bump top -> id={:?}", wid);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn restore_z_order_and_show(&mut self) {
+        // 先激活应用，避免在后台调用 orderFront 导致系统重排到前台时打乱顺序。
+        {
+            use objc2::{class, msg_send};
+            use objc2_app_kit::NSApplication;
+            unsafe {
+                let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
+                let _: () = msg_send![app, activateIgnoringOtherApps: true];
+            }
+        }
+
+        // 生成 union 序列：已记录顺序 + 新增未记录窗口（保持当前 map 顺序）。
+        let mut ordered: Vec<WindowId> = self.window_z_order.clone();
+        for id in self.windows.keys() {
+            if !ordered.contains(id) {
+                ordered.push(*id);
+            }
+        }
+
+        // 精确重建：按“自底向顶”的顺序依次调用 order_front，
+        // 最后对“最顶层窗口”调用 order_front_and_activate 设为 key。
+        // 该方法不依赖 windowNumber，避免因窗口号变化导致不稳定。
+        // 恢复前打印详细映射，便于核对窗口与 ID 的对应关系。
+        self.debug_log_recorded_order("restore z-order (bottom->top)", &ordered);
+        for wid in ordered.iter() {
+            if let Some(wc) = self.windows.get(wid) {
+                wc.display.window.order_front();
+            }
+        }
+        if let Some(&top_id) = ordered.last() {
+            if let Some(top_wc) = self.windows.get(&top_id) {
+                top_wc.display.window.order_front_and_activate();
+                // 二次精确校正：基于当前 windowNumber，自顶向下用 order_below 级联放置，
+                // 确保最终堆叠顺序与记录完全一致。
+                let mut anchor = top_wc.display.window.window_number();
+                for wid in ordered.iter().rev().skip(1) {
+                    if let Some(wc) = self.windows.get(wid) {
+                        wc.display.window.order_below(anchor);
+                        anchor = wc.display.window.window_number();
+                    }
+                }
+            }
+        }
+
+        // 避免刚显示后立刻被“自动隐藏”评估误伤。
+        self.pending_auto_hide_eval = false;
+        let now = Instant::now();
+        self.suppress_auto_hide_until = Some(now + Duration::from_millis(400));
+        self.suppress_focus_reorder_until = Some(now + Duration::from_millis(300));
+        // 将记录更新为我们刚刚应用的顺序，确保后续一致。
+        self.window_z_order = ordered;
+        self.windows_shown = true;
     }
 
     /// Create initial window and load GL platform.
@@ -175,7 +378,28 @@ impl Processor {
 
         self.gl_config = Some(window_context.display.gl_context().config());
         let new_id = window_context.id();
+        #[cfg(target_os = "macos")]
+        {
+            let title = window_context.display.window.title().to_string();
+            let num = window_context.display.window.window_number();
+            log::debug!("[macOS] create window: '{}' (num={}, id={:?})", title, num, new_id);
+        }
         self.windows.insert(new_id, window_context);
+        #[cfg(target_os = "macos")]
+        {
+            // 初始窗口置于栈顶。
+            self.window_z_order.retain(|w| *w != new_id);
+            self.window_z_order.push(new_id);
+        }
+
+        // macOS：创建后立即置前显示，并进入“显示”状态，避免用户看不到新窗口。
+        #[cfg(target_os = "macos")]
+        if let Some(wc) = self.windows.get(&new_id) {
+            wc.display.window.order_front_and_activate();
+            self.pending_auto_hide_eval = false;
+            self.suppress_auto_hide_until = Some(Instant::now() + Duration::from_millis(400));
+            self.windows_shown = true;
+        }
 
         Ok(())
     }
@@ -205,15 +429,27 @@ impl Processor {
         )?;
 
         let id = window_context.id();
-        self.windows.insert(id, window_context);
-
-        // 若当前通过菜单处于“显示”状态，则让新窗口也立即可见（macOS：前置显示）。
         #[cfg(target_os = "macos")]
-        if self.windows_shown {
-            // 处于“显示全部”状态时，确保新窗口立即置前显示。
-            if let Some(new_wc) = self.windows.get(&id) {
-                new_wc.display.window.order_front_and_activate();
-            }
+        {
+            let title = window_context.display.window.title().to_string();
+            let num = window_context.display.window.window_number();
+            log::debug!("[macOS] create window: '{}' (num={}, id={:?})", title, num, id);
+        }
+        self.windows.insert(id, window_context);
+        #[cfg(target_os = "macos")]
+        {
+            // 新窗口加入栈顶。
+            self.window_z_order.retain(|w| *w != id);
+            self.window_z_order.push(id);
+        }
+
+        // macOS：新建窗口后立即置前显示，并进入“显示”状态。
+        #[cfg(target_os = "macos")]
+        if let Some(new_wc) = self.windows.get(&id) {
+            new_wc.display.window.order_front_and_activate();
+            self.pending_auto_hide_eval = false;
+            self.suppress_auto_hide_until = Some(Instant::now() + Duration::from_millis(400));
+            self.windows_shown = true;
         }
         Ok(())
     }
@@ -296,6 +532,29 @@ impl ApplicationHandler<Event> for Processor {
         #[cfg(target_os = "macos")]
         if matches!(event, WindowEvent::Focused(false)) {
             self.pending_auto_hide_eval = true;
+        }
+        // macOS: 若窗口获得焦点，更新层级顺序（置顶）。
+        #[cfg(target_os = "macos")]
+        if matches!(event, WindowEvent::Focused(true)) {
+            let mut suppressed = false;
+            if let Some(deadline) = self.suppress_focus_reorder_until {
+                if Instant::now() <= deadline {
+                    suppressed = true;
+                } else {
+                    self.suppress_focus_reorder_until = None;
+                }
+            }
+            if suppressed {
+                let title = window_context.display.window.title().to_string();
+                let num = window_context.display.window.window_number();
+                log::debug!("[macOS] focus reorder suppressed: '{}' (num={}, id={:?})", title, num, window_id);
+            } else {
+                self.window_z_order.retain(|w| *w != window_id);
+                self.window_z_order.push(window_id);
+                let title = window_context.display.window.title().to_string();
+                let num = window_context.display.window.window_number();
+                log::debug!("[macOS] focus -> top: '{}' (num={}, id={:?})", title, num, window_id);
+            }
         }
 
         window_context.handle_event(
@@ -404,13 +663,18 @@ impl ApplicationHandler<Event> for Processor {
                 let show = !self.windows_shown;
                 #[cfg(target_os = "macos")]
                 if show {
-                    for window_context in self.windows.values() {
-                        window_context.display.window.order_front_and_activate();
-                    }
-                    // 避免刚显示后立刻被“自动隐藏”评估误伤。
-                    self.pending_auto_hide_eval = false;
-                    self.suppress_auto_hide_until = Some(Instant::now() + Duration::from_millis(400));
+                    // 统一调用恢复逻辑，确保系统菜单/快捷键恢复时也一致。
+                    self.restore_z_order_and_show();
                 } else {
+                    // 在隐藏过程中，可能伴随 AppKit 触发的一系列焦点变化事件；
+                    // 这里先短暂抑制“焦点导致的重排”，避免污染我们记录的顺序。
+                    self.suppress_focus_reorder_until = Some(Instant::now() + Duration::from_millis(400));
+                    // 在隐藏前，如记录不完整则抓取一次真实层级顺序；
+                    // 若记录已完整，优先信任“最后一次聚焦更新”的顺序，避免被菜单点击造成的瞬态重排污染。
+                    #[cfg(target_os = "macos")]
+                    if self.window_z_order.len() != self.windows.len() || self.window_z_order.is_empty() {
+                        self.capture_current_z_order_from_appkit();
+                    }
                     for window_context in self.windows.values() {
                         window_context.display.window.order_out();
                     }
@@ -424,6 +688,20 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 }
                 self.windows_shown = show;
+            },
+            // 显示全部窗口（用于“新增窗口”后确保所有窗口可见）。
+            (EventType::ShowAllWindows, _) => {
+                #[cfg(target_os = "macos")]
+                {
+                    self.restore_z_order_and_show();
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    for window_context in self.windows.values_mut() {
+                        window_context.display.window.set_visible(true);
+                    }
+                }
+                self.windows_shown = true;
             },
             // Create a new terminal window.
             (EventType::CreateWindow(options), _) => {
@@ -478,6 +756,12 @@ impl ApplicationHandler<Event> for Processor {
                     },
                     _ => return,
                 };
+
+                // macOS: 从层级记录中移除该窗口。
+                #[cfg(target_os = "macos")]
+                {
+                    self.window_z_order.retain(|w| *w != *window_id);
+                }
 
                 // Unschedule pending events.
                 self.scheduler.unschedule_window(window_context.id());
@@ -542,11 +826,27 @@ impl ApplicationHandler<Event> for Processor {
                 }
 
                 if !is_active && !suppressed {
+                    // 同理：准备隐藏前抑制短时间内的焦点重排。
+                    self.suppress_focus_reorder_until = Some(Instant::now() + Duration::from_millis(400));
+                    // 应用失活准备隐藏前，如记录不完整则同步记录一次真实层级顺序；
+                    // 否则保留上次聚焦顺序，避免系统窗口干扰。
+                    if self.window_z_order.len() != self.windows.len() || self.window_z_order.is_empty() {
+                        self.capture_current_z_order_from_appkit();
+                    }
                     for wc in self.windows.values() {
                         wc.display.window.order_out();
                     }
                     self.windows_shown = false;
                 }
+
+                // 若刚从非激活切换为激活（例如通过 Dock/菜单“显示”恢复），
+                // 按记录顺序恢复窗口层级，确保与手动调整一致。
+                if !self.app_was_active && is_active {
+                    self.restore_z_order_and_show();
+                }
+
+                // 记录当前激活状态供下轮对比。
+                self.app_was_active = is_active;
             }
             // 清除此轮可能残留的评估标志。
             self.pending_auto_hide_eval = false;
@@ -631,6 +931,8 @@ pub enum EventType {
     Scroll(Scroll),
     /// Toggle visibility of all windows (macOS menu click).
     ToggleAllWindows,
+    /// Unconditionally show all windows (used after creating a new window from menu).
+    ShowAllWindows,
     CreateWindow(WindowOptions),
     #[cfg(unix)]
     IpcConfig(IpcConfig),
@@ -2020,6 +2322,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
                 | EventType::ToggleAllWindows
+                | EventType::ShowAllWindows
                 | EventType::Frame => (),
             },
             WinitEvent::WindowEvent { event, .. } => {

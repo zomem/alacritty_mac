@@ -200,24 +200,7 @@ impl Window {
         #[cfg(target_os = "macos")]
         use_srgb_color_space(&window);
 
-        // 将窗口与状态栏点击进行绑定：点击菜单栏图标切换显示/隐藏。
-        #[cfg(target_os = "macos")]
-        {
-            let ns_ptr = match window.window_handle().unwrap().as_raw() {
-                RawWindowHandle::AppKit(handle) => {
-                    assert!(MainThreadMarker::new().is_some());
-                    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
-                    let ns_window = view.window().unwrap();
-                    (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
-                        as *mut objc2_app_kit::NSWindow)
-                        .cast::<AnyObject>()
-                },
-                _ => std::ptr::null_mut(),
-            };
-            if !ns_ptr.is_null() {
-                status_bar::bind_toggle_to_window(ns_ptr);
-            }
-        }
+        // macOS：不为每个窗口创建独立状态栏项，仅保留全局主状态栏。
 
         let scale_factor = window.scale_factor();
         log::info!("Window scale factor: {scale_factor}");
@@ -302,6 +285,77 @@ impl Window {
                     as *mut objc2_app_kit::NSWindow)
                     .cast::<AnyObject>();
                 let _: () = objc2::msg_send![ns_ptr, orderOut: std::ptr::null::<AnyObject>()];
+            },
+            _ => {}
+        }
+    }
+
+    /// macOS: 仅前置显示窗口，但不改变 key 窗口（不激活为 key）。
+    #[cfg(target_os = "macos")]
+    pub fn order_front(&self) {
+        let _mt = MainThreadMarker::new().expect("must be on main thread");
+        match self.window.window_handle().unwrap().as_raw() {
+            RawWindowHandle::AppKit(handle) => unsafe {
+                let view = handle.ns_view.cast::<NSView>().as_ref();
+                let ns_window = view.window().unwrap();
+                let ns_ptr = (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
+                    as *mut objc2_app_kit::NSWindow)
+                    .cast::<AnyObject>();
+                let _: () = objc2::msg_send![ns_ptr, orderFront: std::ptr::null::<AnyObject>()];
+            },
+            _ => {}
+        }
+    }
+
+    /// macOS: 返回窗口的 windowNumber（用于相对排序）。
+    #[cfg(target_os = "macos")]
+    pub fn window_number(&self) -> i64 {
+        let _mt = MainThreadMarker::new().expect("must be on main thread");
+        match self.window.window_handle().unwrap().as_raw() {
+            RawWindowHandle::AppKit(handle) => unsafe {
+                let view = handle.ns_view.cast::<NSView>().as_ref();
+                let ns_window = view.window().unwrap();
+                let ns_ptr = (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
+                    as *mut objc2_app_kit::NSWindow)
+                    .cast::<AnyObject>();
+                let num: i64 = objc2::msg_send![ns_ptr, windowNumber];
+                num
+            },
+            _ => 0,
+        }
+    }
+
+    /// macOS: 将窗口相对某个 windowNumber 置于其上方。
+    #[cfg(target_os = "macos")]
+    pub fn order_above(&self, relative_to: i64) {
+        let _mt = MainThreadMarker::new().expect("must be on main thread");
+        match self.window.window_handle().unwrap().as_raw() {
+            RawWindowHandle::AppKit(handle) => unsafe {
+                let view = handle.ns_view.cast::<NSView>().as_ref();
+                let ns_window = view.window().unwrap();
+                let ns_ptr = (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
+                    as *mut objc2_app_kit::NSWindow)
+                    .cast::<AnyObject>();
+                // NSWindowAbove = 1 (NSWindowOrderingMode)
+                let _: () = objc2::msg_send![ns_ptr, orderWindow: 1i64, relativeTo: relative_to];
+            },
+            _ => {}
+        }
+    }
+
+    /// macOS: 将窗口相对某个 windowNumber 置于其下方。
+    #[cfg(target_os = "macos")]
+    pub fn order_below(&self, relative_to: i64) {
+        let _mt = MainThreadMarker::new().expect("must be on main thread");
+        match self.window.window_handle().unwrap().as_raw() {
+            RawWindowHandle::AppKit(handle) => unsafe {
+                let view = handle.ns_view.cast::<NSView>().as_ref();
+                let ns_window = view.window().unwrap();
+                let ns_ptr = (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
+                    as *mut objc2_app_kit::NSWindow)
+                    .cast::<AnyObject>();
+                // NSWindowBelow = -1
+                let _: () = objc2::msg_send![ns_ptr, orderWindow: -1i64, relativeTo: relative_to];
             },
             _ => {}
         }

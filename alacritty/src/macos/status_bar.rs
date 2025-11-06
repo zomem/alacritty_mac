@@ -3,7 +3,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2_foundation::NSString;
 use objc2_app_kit::{NSApplication, NSStatusBar, NSStatusItem, NSMenu, NSMenuItem};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::cell::RefCell;
 use std::sync::OnceLock;
 use winit::event_loop::EventLoopProxy;
 
@@ -11,6 +13,7 @@ use crate::cli::WindowOptions;
 use crate::event::{Event, EventType};
 
 // 全局保存指针（原生指针是线程安全可共享的）。
+// 兼容旧实现的全局指针（不再作为逻辑依据，仅做向后兼容）。
 static STATUS_ITEM_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 static NSWINDOW_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 static MENU_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
@@ -29,6 +32,21 @@ pub struct PopupBorderStyle {
 }
 
 static BORDER_STYLE: OnceLock<PopupBorderStyle> = OnceLock::new();
+
+// 每个窗口的状态栏项记录
+struct PerWindowStatus {
+    status_item: *mut AnyObject,
+    menu: *mut AnyObject,
+    ns_window: *mut AnyObject,
+}
+
+// handler(this) -> PerWindowStatus 的映射（仅在主线程访问）。
+thread_local! {
+    static HANDLER_MAP: RefCell<HashMap<*mut AnyObject, PerWindowStatus>> = RefCell::new(HashMap::new());
+}
+
+// 递增编号用于默认的每窗口标题，例如“窗口1/窗口2 …”。
+static NEXT_INDEX: AtomicUsize = AtomicUsize::new(1);
 
 fn parse_border_style_from_env() -> PopupBorderStyle {
     let mut style = PopupBorderStyle { width: 2.0, color: (0, 0, 0), alpha: 0.4, radius: 8.0, shadow: true };
@@ -88,37 +106,52 @@ fn ensure_click_handler_class() -> &'static AnyClass {
         let mut builder = ClassBuilder::new(name.as_c_str(), class!(NSObject))
             .expect("create class builder");
 
-        extern "C" fn on_click(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+        extern "C" fn on_click(this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
             // 根据当前事件类型判断是否为右键
+            let mut handled_right = false;
             unsafe {
                 let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
                 let ev: *mut AnyObject = msg_send![app, currentEvent];
                 if !ev.is_null() {
                     let btn_num: i64 = msg_send![ev, buttonNumber];
                     if btn_num == 1 { // 右键
-                        // 右键：弹出菜单（锚定到当前 status item）
-                        let menu = MENU_PTR.load(Ordering::Relaxed);
-                        let item = STATUS_ITEM_PTR.load(Ordering::Relaxed);
-                        if !menu.is_null() && !item.is_null() {
-                            let _: () = msg_send![item, popUpStatusItemMenu: menu];
-                            return;
+                        // 右键：针对当前 handler 对应的窗口弹出其独立菜单
+                        let this_ptr = (this as *const _ as *mut AnyObject);
+                        let (menu_ptr, item_ptr) = HANDLER_MAP.with(|map| {
+                            let map = map.borrow();
+                            match map.get(&this_ptr) {
+                                Some(rec) => (rec.menu, rec.status_item),
+                                None => (std::ptr::null_mut(), std::ptr::null_mut()),
+                            }
+                        });
+                        if !menu_ptr.is_null() && !item_ptr.is_null() {
+                            let _: () = msg_send![item_ptr, popUpStatusItemMenu: menu_ptr];
+                            handled_right = true;
                         }
                     }
                 }
             }
-            // 左键或无菜单：切换全部窗口显示/隐藏（通过事件分发到主循环统一处理）。
+            if handled_right { return; }
+            // 左键：切换“当前 handler 对应窗口”的显示/隐藏；若无绑定窗口则切换全部。
+            let this_ptr = (this as *const _ as *mut AnyObject);
+            let ns_win = HANDLER_MAP.with(|map| map.borrow().get(&this_ptr).map(|r| r.ns_window));
+            if let Some(win) = ns_win {
+                if !win.is_null() { toggle_specific_window(win); return; }
+            }
+            // 兜底：若找不到对应窗口，则触发“切换全部窗口”。
             if let Some(proxy) = EVENT_PROXY.get() {
                 let _ = proxy.send_event(Event::new(EventType::ToggleAllWindows, None));
             }
         }
 
         extern "C" fn on_new_window(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
-            // 通过事件代理请求创建新窗口
+            // 通过事件代理请求创建新窗口；随后无条件显示所有窗口。
             if let Some(proxy) = EVENT_PROXY.get() {
                 let _ = proxy.send_event(Event::new(
                     EventType::CreateWindow(WindowOptions::default()),
                     None,
                 ));
+                let _ = proxy.send_event(Event::new(EventType::ShowAllWindows, None));
             }
         }
 
@@ -207,11 +240,10 @@ fn configure_popup_window(ns_win: *mut AnyObject) {
 pub fn status_item_anchor() -> Option<(f64, f64)> {
     assert!(MainThreadMarker::new().is_some());
 
+    // 默认返回第一个状态栏项的锚点（主要用于已有实现的定位）。
+    // 为简化，此处沿用历史全局指针；若未设置则返回 None。
     let item = STATUS_ITEM_PTR.load(Ordering::Relaxed);
-    if item.is_null() {
-        return None;
-    }
-
+    if item.is_null() { return None; }
     unsafe {
         let btn: *mut AnyObject = msg_send![item, button];
         if btn.is_null() {
@@ -237,12 +269,8 @@ pub fn status_item_anchor() -> Option<(f64, f64)> {
 
 //
 
-fn toggle_main_window(sender: *mut AnyObject) {
-    let win = NSWINDOW_PTR.load(Ordering::Relaxed);
-    if win.is_null() {
-        return;
-    }
-
+fn toggle_specific_window(win: *mut AnyObject) {
+    if win.is_null() { return; }
     unsafe {
         let visible: bool = msg_send![win, isVisible];
         if visible {
@@ -280,60 +308,13 @@ pub fn init_status_bar_text(text: &str) {
 /// 需在创建好 winit 窗口后调用，并传入其 NSWindow 指针。
 pub fn bind_toggle_to_window(ns_window: *mut AnyObject) {
     assert!(MainThreadMarker::new().is_some());
-
-    NSWINDOW_PTR.store(ns_window, Ordering::Relaxed);
-
-    // 没有状态栏项则无需绑定
-    let item = STATUS_ITEM_PTR.load(Ordering::Relaxed);
-    if item.is_null() {
-        return;
-    }
-
-    // 构建点击处理对象并设置为 target/action
-    let cls = ensure_click_handler_class();
-    let handler: Retained<AnyObject> = unsafe { msg_send![cls, new] };
-
-    unsafe {
-        // 将事件绑定到 status item 的 button 上，兼容性更好。
-        let btn: *mut AnyObject = msg_send![item, button];
-        if !btn.is_null() {
-            let _: () = msg_send![btn, setTarget: &*handler];
-            let _: () = msg_send![btn, setAction: sel!(onStatusItemClick:)];
-
-            // 让按钮在左键与右键抬起时都发送 action（NSEventMaskLeftMouseUp|NSEventMaskRightMouseUp）
-            let left_up_mask: u64 = 1u64 << 2;
-            let right_up_mask: u64 = 1u64 << 4;
-            let mask = left_up_mask | right_up_mask;
-            let _: u64 = msg_send![btn, sendActionOn: mask];
-        } else {
-            // 回退到直接绑定在 item 上（旧 API）
-            let _: () = msg_send![item, setTarget: &*handler];
-            let _: () = msg_send![item, setAction: sel!(onStatusItemClick:)];
-        }
-    }
-
-    // 构建（或获取）右键菜单，并将菜单项目标设置为同一 handler
-    ensure_context_menu_with_target((&*handler) as *const _ as *mut AnyObject);
-
-    // 保持 handler 存活至进程结束
-    std::mem::forget(handler);
+    // 为“每个窗口”创建独立的状态栏项与菜单，并绑定点击事件。
+    create_status_item_for_window(ns_window, Some("Alacritty"));
 }
 
 /// 创建或复用右键菜单，并设置目标对象。
-fn ensure_context_menu_with_target(target: *mut AnyObject) {
-    // 已存在则只需更新 target（保险起见重设一次）
-    let existing = MENU_PTR.load(Ordering::Relaxed);
+fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
     unsafe {
-        if !existing.is_null() {
-            // 找到第一个菜单项并设置其 target
-            let first_item: *mut AnyObject = msg_send![existing, itemAtIndex: 0i64];
-            if !first_item.is_null() {
-                let _: () = msg_send![first_item, setTarget: target];
-                let _: () = msg_send![first_item, setAction: sel!(onStatusItemNewWindow:)];
-            }
-            return;
-        }
-
         // 创建菜单
         let menu: *mut AnyObject = msg_send![class!(NSMenu), new];
 
@@ -350,8 +331,7 @@ fn ensure_context_menu_with_target(target: *mut AnyObject) {
         let _: () = msg_send![mi, setTarget: target];
         let _: () = msg_send![menu, addItem: mi];
 
-        // 保存到全局（交由系统托管内存，不在 Rust 端释放）
-        MENU_PTR.store(menu, Ordering::Relaxed);
+        menu
     }
 }
 
@@ -361,3 +341,110 @@ pub fn set_event_proxy(proxy: EventLoopProxy<Event>) {
 }
 
 // 显示/隐藏的统一实现已移动至 `display/window.rs`，这里不再持有窗口列表。
+
+/// 为指定 NSWindow 创建一个独立的状态栏项与菜单，并绑定事件。
+pub fn create_status_item_for_window(ns_window: *mut AnyObject, title: Option<&str>) {
+    assert!(MainThreadMarker::new().is_some());
+    let _ = BORDER_STYLE.get_or_init(parse_border_style_from_env);
+
+    // 创建状态栏项
+    let bar = NSStatusBar::systemStatusBar();
+    let item: Retained<NSStatusItem> = bar.statusItemWithLength(-1.0);
+
+    // 默认标题：窗口N
+    let label = if let Some(t) = title { t.to_string() } else {
+        let idx = NEXT_INDEX.fetch_add(1, Ordering::Relaxed);
+        format!("窗口{idx}")
+    };
+    let title_ns = NSString::from_str(&label);
+    item.setTitle(Some(&title_ns));
+
+    // 创建 handler 并绑定 action
+    let cls = ensure_click_handler_class();
+    let handler: Retained<AnyObject> = unsafe { msg_send![cls, new] };
+
+    unsafe {
+        let btn: *mut AnyObject = msg_send![&*item, button];
+        if !btn.is_null() {
+            let _: () = msg_send![btn, setTarget: &*handler];
+            let _: () = msg_send![btn, setAction: sel!(onStatusItemClick:)];
+            // 左键/右键抬起都触发 action
+            let left_up_mask: u64 = 1u64 << 2;
+            let right_up_mask: u64 = 1u64 << 4;
+            let mask = left_up_mask | right_up_mask;
+            let _: u64 = msg_send![btn, sendActionOn: mask];
+        } else {
+            // 旧 API 回退
+            let _: () = msg_send![&*item, setTarget: &*handler];
+            let _: () = msg_send![&*item, setAction: sel!(onStatusItemClick:)];
+        }
+    }
+
+    // 为该 handler 构建独立菜单
+    let menu = build_context_menu_for_target((&*handler) as *const _ as *mut AnyObject);
+
+    // 建立映射：handler -> {item, menu, window}
+    let item_ptr: *mut AnyObject = (&*item) as *const _ as *mut AnyObject;
+    let handler_ptr: *mut AnyObject = (&*handler) as *const _ as *mut AnyObject;
+    HANDLER_MAP.with(|map| {
+        map.borrow_mut().insert(
+            handler_ptr,
+            PerWindowStatus { status_item: item_ptr, menu, ns_window },
+        );
+    });
+
+    // 保持对象存活（简单处理：泄漏到进程结束）
+    std::mem::forget(item);
+    std::mem::forget(handler);
+}
+
+/// 创建一个全局主状态栏项，用于在无窗口时也可新建窗口或切换全部窗口。
+pub fn create_global_status_item(title: &str) {
+    assert!(MainThreadMarker::new().is_some());
+    let _ = BORDER_STYLE.get_or_init(parse_border_style_from_env);
+
+    let bar = NSStatusBar::systemStatusBar();
+    let item: Retained<NSStatusItem> = bar.statusItemWithLength(-1.0);
+
+    let title_ns = NSString::from_str(title);
+    item.setTitle(Some(&title_ns));
+
+    // 处理器
+    let cls = ensure_click_handler_class();
+    let handler: Retained<AnyObject> = unsafe { msg_send![cls, new] };
+
+    unsafe {
+        let btn: *mut AnyObject = msg_send![&*item, button];
+        if !btn.is_null() {
+            let _: () = msg_send![btn, setTarget: &*handler];
+            let _: () = msg_send![btn, setAction: sel!(onStatusItemClick:)];
+            let left_up_mask: u64 = 1u64 << 2;
+            let right_up_mask: u64 = 1u64 << 4;
+            let mask = left_up_mask | right_up_mask;
+            let _: u64 = msg_send![btn, sendActionOn: mask];
+        } else {
+            let _: () = msg_send![&*item, setTarget: &*handler];
+            let _: () = msg_send![&*item, setAction: sel!(onStatusItemClick:)];
+        }
+    }
+
+    // 上下文菜单
+    let menu = build_context_menu_for_target((&*handler) as *const _ as *mut AnyObject);
+
+    // 建立映射（无绑定窗口）
+    let item_ptr: *mut AnyObject = (&*item) as *const _ as *mut AnyObject;
+    let handler_ptr: *mut AnyObject = (&*handler) as *const _ as *mut AnyObject;
+    HANDLER_MAP.with(|map| {
+        map.borrow_mut().insert(
+            handler_ptr,
+            PerWindowStatus { status_item: item_ptr, menu, ns_window: std::ptr::null_mut() },
+        );
+    });
+
+    // 兼容旧全局指针（用于可能的锚点/回退）
+    STATUS_ITEM_PTR.store(item_ptr, Ordering::Relaxed);
+    MENU_PTR.store(menu, Ordering::Relaxed);
+
+    std::mem::forget(item);
+    std::mem::forget(handler);
+}

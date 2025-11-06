@@ -189,7 +189,8 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "macos")]
     {
         status_bar::set_event_proxy(window_event_loop.create_proxy());
-        status_bar::init_status_bar_text("Alacritty");
+        // 创建全局主状态栏项，确保即使无窗口也能从菜单栏新建窗口
+        status_bar::create_global_status_item("Alacritty");
     }
 
     // Create the IPC socket listener.
