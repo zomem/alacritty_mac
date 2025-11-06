@@ -227,7 +227,8 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                     .collect();
                 let idx = if row < 0 { 0 } else { row as usize };
                 let text_str = if idx < lines.len() {
-                    crate::path_util::shorten_home(&lines[idx])
+                    let raw = lines[idx].trim();
+                    if raw == "---" { "── 分隔线 ──".to_string() } else { crate::path_util::shorten_home(raw) }
                 } else {
                     String::new()
                 };
@@ -334,6 +335,32 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             }
         }
 
+        // 在选中行后插入分隔线（---），若未选中则追加到末尾
+        extern "C" fn on_config_add_separator(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+            unsafe {
+                let table = CONFIG_TABLE_PTR.load(Ordering::Relaxed);
+                let mut lines: Vec<String> = get_saved_paths_string()
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                let mut insert_at = lines.len();
+                if !table.is_null() {
+                    let row: isize = msg_send![table, selectedRow];
+                    if row >= 0 {
+                        let idx = row as usize;
+                        if idx <= lines.len() { insert_at = idx.saturating_add(1); }
+                    }
+                }
+                if insert_at > lines.len() { insert_at = lines.len(); }
+                lines.insert(insert_at, "---".to_string());
+                set_saved_paths_string(&lines.join("\n"));
+                update_config_table();
+                rebuild_all_context_menus();
+            }
+        }
+
         // 拖拽排序：整行可拖拽
         extern "C" fn table_view_write_rows(
             _this: &AnyObject,
@@ -426,6 +453,7 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             builder.add_method(sel!(tableView:acceptDrop:row:dropOperation:), table_view_accept_drop as extern "C" fn(_, _, _, _, isize, isize) -> Bool);
             builder.add_method(sel!(onRowDelete:), on_row_delete as extern "C" fn(_, _, _));
             builder.add_method(sel!(onConfigRemoveSelected:), on_config_remove_selected as extern "C" fn(_, _, _));
+            builder.add_method(sel!(onConfigAddSeparator:), on_config_add_separator as extern "C" fn(_, _, _));
         }
 
         let cls = builder.register();
@@ -672,6 +700,13 @@ fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
         for line in saved.lines() {
             let p = line.trim();
             if p.is_empty() { continue; }
+            // 允许在配置中用 "---" 作为分隔线
+            if p == "---" {
+                let sep_item: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+                let _: () = msg_send![menu, addItem: sep_item];
+                // 分隔线不计入“是否添加了可点击项”
+                continue;
+            }
             // 菜单标题展示 `~`，但 representedObject 保留绝对路径
             // 过长路径在中间使用省略号，避免菜单过宽
             let display = crate::path_util::shorten_home_and_ellipsize(p, 50);
@@ -1035,6 +1070,9 @@ pub unsafe fn open_config_window() {
     let btn_frame_plus = NSRect { origin: NSPoint { x: btn_x, y: btn_y }, size: NSSize { width: btn_w, height: btn_h } };
     let btn_gap = 8.0f64;
     let btn_frame_minus = NSRect { origin: NSPoint { x: btn_x + btn_w + btn_gap, y: btn_y }, size: NSSize { width: btn_w, height: btn_h } };
+    // “分隔线”按钮更宽一些，便于显示文字
+    let sep_w: f64 = 64.0;
+    let btn_frame_sep = NSRect { origin: NSPoint { x: btn_x + (btn_w + btn_gap) * 2.0, y: btn_y }, size: NSSize { width: sep_w, height: btn_h } };
 
     let scroll_x = pad;
     // 底部预留按钮区
@@ -1072,6 +1110,19 @@ pub unsafe fn open_config_window() {
         // NSViewMaxXMargin | NSViewMaxYMargin
         let mask: u64 = (1u64 << 2) | (1u64 << 5);
         let _: () = msg_send![button_minus, setAutoresizingMask: mask];
+    }
+
+    // “分隔线”按钮（在选中行后插入 ---）
+    let btn_title_sep = NSString::from_str("分隔线");
+    let button_sep: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let button_sep: *mut AnyObject = msg_send![button_sep, initWithFrame: btn_frame_sep];
+    let _: () = msg_send![button_sep, setTitle: &*btn_title_sep];
+    let _: () = msg_send![button_sep, setTarget: &*handler];
+    let _: () = msg_send![button_sep, setAction: sel!(onConfigAddSeparator:)];
+    if msg_send![button_sep, respondsToSelector: sel!(setAutoresizingMask:)] {
+        // NSViewMaxXMargin | NSViewMaxYMargin
+        let mask: u64 = (1u64 << 2) | (1u64 << 5);
+        let _: () = msg_send![button_sep, setAutoresizingMask: mask];
     }
 
     // 滚动 + 表格视图显示路径列表
@@ -1153,6 +1204,7 @@ pub unsafe fn open_config_window() {
     let _: () = msg_send![content_view, addSubview: scroll];
     let _: () = msg_send![content_view, addSubview: button_plus];
     let _: () = msg_send![content_view, addSubview: button_minus];
+    let _: () = msg_send![content_view, addSubview: button_sep];
 
     // 保存全局指针并设置初始内容
     CONFIG_WINDOW_PTR.store(win, Ordering::Relaxed);
