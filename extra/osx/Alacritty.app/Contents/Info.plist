@@ -34,6 +34,12 @@
   <string>Alacritty</string>
   <key>NSRequiresAquaSystemAppearance</key>
   <string>NO</string>
+  <!-- 将应用设置为 UIElement：
+       - 隐藏 Dock 图标和应用切换器（Cmd+Tab）条目
+       - 仍可显示窗口与菜单栏状态图标
+       满足“只显示菜单栏图标”的需求 -->
+  <key>LSUIElement</key>
+  <true/>
     <key>NSAppleEventsUsageDescription</key>
     <string>An application in Alacritty would like to access AppleScript.</string>
     <key>NSCalendarsUsageDescription</key>
