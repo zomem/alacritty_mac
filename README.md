@@ -1,5 +1,9 @@
 # alacritty 改
 
+![图片](./images/1.png)
+![图片](./images/2.png)
+![图片](./images/3.png)
+
 # mac 菜单栏 命令窗
 
 cargo run -p alacritty -- -vvv
