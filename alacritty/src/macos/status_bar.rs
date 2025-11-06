@@ -98,6 +98,72 @@ pub fn border_style() -> PopupBorderStyle {
 }
 
 
+fn status_icon_path() -> Option<String> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let try_paths = [
+                dir.join("cmd.png"),
+                dir.join("../Resources/cmd.png"),
+                dir.join("../extra/icons/cmd.png"),
+                dir.join("../../extra/icons/cmd.png"),
+                dir.join("../../../extra/icons/cmd.png"),
+            ];
+            for p in try_paths.iter() {
+                if p.exists() {
+                    return Some(p.display().to_string());
+                }
+            }
+        }
+    }
+
+    let fallback = ["extra/icons/cmd.png", "cmd.png"];
+    for p in fallback.iter() {
+        if std::path::Path::new(p).exists() {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
+unsafe fn set_status_item_icon(item: &NSStatusItem) -> bool {
+    if let Some(path) = status_icon_path() {
+        let ns = NSString::from_str(&path);
+        let img_alloc: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let img: *mut AnyObject = msg_send![img_alloc, initWithContentsOfFile: &*ns];
+        if !img.is_null() {
+            // 将图片标记为模板并缩放到菜单栏标准尺寸（pt）。
+            // 默认 18pt，可通过环境变量 ALACRITTY_STATUS_ICON_SIZE 覆盖。
+            let size_pt: f64 = std::env::var("ALACRITTY_STATUS_ICON_SIZE")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| *v > 0.0 && *v < 64.0)
+                .unwrap_or(18.0);
+            let _: () = msg_send![img, setTemplate: true];
+            let _: () = msg_send![img, setSize: NSSize { width: size_pt, height: size_pt }];
+            let btn: *mut AnyObject = msg_send![item, button];
+            if !btn.is_null() {
+                let _: () = msg_send![btn, setImage: img];
+                let empty = NSString::from_str("");
+                if msg_send![btn, respondsToSelector: sel!(setTitle:)] {
+                    let _: () = msg_send![btn, setTitle: &*empty];
+                }
+                // 确保仅显示图标
+                if msg_send![btn, respondsToSelector: sel!(setImagePosition:)] {
+                    // NSImageOnly = 2
+                    let _: () = msg_send![btn, setImagePosition: 2i64];
+                }
+            } else {
+                let _: () = msg_send![item, setImage: img];
+                let empty = NSString::from_str("");
+                let _: () = msg_send![item, setTitle: &*empty];
+            }
+            return true;
+        }
+    }
+    false
+}
+
+
 // 动态注册一个 Objective-C 类，作为 target/action 的处理对象。
 fn ensure_click_handler_class() -> &'static AnyClass {
     use objc2::declare::ClassBuilder;
@@ -670,9 +736,16 @@ pub fn init_status_bar_text(text: &str) {
     // -1.0 等同于 NSVariableStatusItemLength，使用自适应长度
     let item: Retained<NSStatusItem> = bar.statusItemWithLength(-1.0);
 
-    let title = NSString::from_str(text);
-    // 直接设置 NSStatusItem 的 title（AppKit 建议用 button.title，但该绑定版本尚无 button 方法）
-    item.setTitle(Some(&title));
+    let mut used_icon = false;
+    unsafe { used_icon = set_status_item_icon(&item); }
+    if used_icon {
+        // 对图标项使用方形宽度
+        unsafe { let _: () = msg_send![&*item, setLength: -2.0f64]; }
+    }
+    if !used_icon {
+        let title = NSString::from_str(text);
+        item.setTitle(Some(&title));
+    }
 
     // 防止被释放：让其泄漏到进程生命周期结束（简单可靠）
     let raw: *mut AnyObject = (&*item) as *const _ as *mut AnyObject;
@@ -794,13 +867,19 @@ pub fn create_status_item_for_window(ns_window: *mut AnyObject, title: Option<&s
     let bar = NSStatusBar::systemStatusBar();
     let item: Retained<NSStatusItem> = bar.statusItemWithLength(-1.0);
 
-    // 默认标题：窗口N
-    let label = if let Some(t) = title { t.to_string() } else {
-        let idx = NEXT_INDEX.fetch_add(1, Ordering::Relaxed);
-        format!("窗口{idx}")
-    };
-    let title_ns = NSString::from_str(&label);
-    item.setTitle(Some(&title_ns));
+    let mut used_icon = false;
+    unsafe { used_icon = set_status_item_icon(&item); }
+    if used_icon {
+        unsafe { let _: () = msg_send![&*item, setLength: -2.0f64]; }
+    }
+    if !used_icon {
+        let label = if let Some(t) = title { t.to_string() } else {
+            let idx = NEXT_INDEX.fetch_add(1, Ordering::Relaxed);
+            format!("窗口{idx}")
+        };
+        let title_ns = NSString::from_str(&label);
+        item.setTitle(Some(&title_ns));
+    }
 
     // 创建 handler 并绑定 action
     let cls = ensure_click_handler_class();
@@ -849,8 +928,15 @@ pub fn create_global_status_item(title: &str) {
     let bar = NSStatusBar::systemStatusBar();
     let item: Retained<NSStatusItem> = bar.statusItemWithLength(-1.0);
 
-    let title_ns = NSString::from_str(title);
-    item.setTitle(Some(&title_ns));
+    let mut used_icon = false;
+    unsafe { used_icon = set_status_item_icon(&item); }
+    if used_icon {
+        unsafe { let _: () = msg_send![&*item, setLength: -2.0f64]; }
+    }
+    if !used_icon {
+        let title_ns = NSString::from_str(title);
+        item.setTitle(Some(&title_ns));
+    }
 
     // 处理器
     let cls = ensure_click_handler_class();

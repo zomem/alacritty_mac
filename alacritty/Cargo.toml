@@ -81,6 +81,7 @@ objc2-app-kit = { version = "0.3.1", default-features = false, features = [
     "NSStatusBar",
     "NSStatusItem",
     "NSStatusBarButton",
+    "NSImage",
 ] }
 
 [target.'cfg(windows)'.dependencies]
