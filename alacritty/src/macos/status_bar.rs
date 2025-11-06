@@ -673,7 +673,8 @@ fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
             let p = line.trim();
             if p.is_empty() { continue; }
             // 菜单标题展示 `~`，但 representedObject 保留绝对路径
-            let display = crate::path_util::shorten_home(p);
+            // 过长路径在中间使用省略号，避免菜单过宽
+            let display = crate::path_util::shorten_home_and_ellipsize(p, 50);
             let title = NSString::from_str(&display);
             let empty_key = NSString::from_str("");
             let mi_alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
