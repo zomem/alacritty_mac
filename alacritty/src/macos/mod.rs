@@ -4,6 +4,7 @@ use objc2_foundation::{NSDictionary, NSString, NSUserDefaults, ns_string};
 pub mod locale;
 pub mod proc;
 pub mod status_bar;
+pub mod activation_guard;
 
 pub fn disable_autofill() {
     unsafe {

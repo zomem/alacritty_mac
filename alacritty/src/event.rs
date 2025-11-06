@@ -861,7 +861,14 @@ impl ApplicationHandler<Event> for Processor {
                 // 若刚从非激活切换为激活（例如通过 Dock/菜单“显示”恢复），
                 // 按记录顺序恢复窗口层级，确保与手动调整一致。
                 if !self.app_was_active && is_active {
-                    self.restore_z_order_and_show();
+                    // 抑制情形：
+                    // 1) 显式设置的一次性抑制（打开配置窗口前设置）；
+                    // 2) 当前 keyWindow 就是配置窗口（用户直接点击配置窗口激活应用）。
+                    let suppressed_once = crate::macos::activation_guard::take_suppression();
+                    let activated_by_config = crate::macos::status_bar::config_window_is_key_window();
+                    if !(suppressed_once || activated_by_config) {
+                        self.restore_z_order_and_show();
+                    }
                 }
 
                 // 记录当前激活状态供下轮对比。

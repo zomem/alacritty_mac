@@ -1027,6 +1027,29 @@ fn update_config_table() {
     }
 }
 
+/// 若当前 App 的 keyWindow 就是“配置”窗口，则返回 true。
+/// 用于在“应用从非激活切回激活”的边沿判断是否因点击配置窗口而触发，
+/// 若是，则不应恢复显示所有终端窗口。
+pub fn config_window_is_key_window() -> bool {
+    unsafe {
+        let win = CONFIG_WINDOW_PTR.load(Ordering::Relaxed);
+        if win.is_null() { return false; }
+        let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
+        if app.is_null() { return false; }
+        let key: *mut AnyObject = msg_send![app, keyWindow];
+        if !key.is_null() && key == win {
+            return true;
+        }
+        // 备用判断：mainWindow 也可能为配置窗口
+        let main: *mut AnyObject = msg_send![app, mainWindow];
+        if !main.is_null() && main == win {
+            return true;
+        }
+        let is_key: Bool = msg_send![win, isKeyWindow];
+        is_key == Bool::YES
+    }
+}
+
 /// 重新为所有状态栏项重建右键菜单（用于添加/更新目录后生效）。
 fn rebuild_all_context_menus() {
     HANDLER_MAP.with(|map| {
@@ -1086,6 +1109,9 @@ pub unsafe fn open_config_window() {
     assert!(MainThreadMarker::new().is_some());
     let existing = CONFIG_WINDOW_PTR.load(Ordering::Relaxed);
     if !existing.is_null() {
+        // 若通过配置入口激活应用，仅希望显示配置窗口本身；
+        // 抑制一次“恢复全部终端窗口”。
+        crate::macos::activation_guard::suppress_next_activation_restore();
         // 确保已存在的配置窗口也会移动到当前桌面
         if msg_send![existing, respondsToSelector: sel!(setCollectionBehavior:)]
             && msg_send![existing, respondsToSelector: sel!(collectionBehavior)]
@@ -1297,7 +1323,8 @@ pub unsafe fn open_config_window() {
     CONFIG_TABLE_PTR.store(table, Ordering::Relaxed);
     update_config_table();
 
-    // 显示窗口
+    // 显示窗口：先标记抑制一次“激活后恢复全部窗口”，再激活应用。
+    crate::macos::activation_guard::suppress_next_activation_restore();
     let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
     let _: () = msg_send![app, activateIgnoringOtherApps: true];
     let _: () = msg_send![win, center];
