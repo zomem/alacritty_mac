@@ -342,7 +342,7 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                     if !c_ptr.is_null() { std::ffi::CStr::from_ptr(c_ptr).to_string_lossy().into_owned() } else { String::new() }
                 } else { String::new() };
                 super::status_bar::set_saved_hotkey_all(code, mods_i, &display);
-                eprintln!("[hotkey] commit tag={} -> code={} mods={}", tag_val, code, mods_i);
+                // removed noisy debug print
                 hotkey::register_hotkey_combo(code, mods_i as u32);
             }
         }
@@ -363,7 +363,7 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .count();
-            println!("[配置] 行数: {}", count);
+            // removed noisy debug print
             count as isize
         }
 
@@ -460,7 +460,7 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                 if table.is_null() { return; }
                 // 通过 NSTableView 计算该视图所在行
                 let row: isize = msg_send![table, rowForView: sender];
-                println!("[配置] 删除 row={}", row);
+                // removed noisy debug print
                 if row < 0 { return; }
                 let mut lines: Vec<String> = get_saved_paths_string()
                     .lines()
@@ -534,7 +534,7 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             unsafe {
                 let first: u64 = msg_send![index_set, firstIndex];
                 let row = first as isize;
-                println!("[配置] writeRows: row={}", row);
+                // removed noisy debug print
                 // 为拖拽声明粘贴板类型并写入占位数据（本地拖拽也需要）
                 if !pb.is_null() {
                     let drag_type = NSString::from_str("com.alacritty.pathrow");
@@ -560,7 +560,7 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                 let drop_above: i64 = 1; // NSTableViewDropAbove
                 let _: () = msg_send![table, setDropRow: row, dropOperation: drop_above];
             }
-            println!("[配置] validateDrop: row={}", row);
+            // removed noisy debug print
             16 // NSDragOperationMove
         }
 
@@ -575,7 +575,7 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             unsafe {
                 let from = DRAG_SOURCE_INDEX.swap(-1, Ordering::Relaxed);
                 if from < 0 { return Bool::NO; }
-                println!("[配置] acceptDrop: from={} to_row={}", from, row);
+                // removed noisy debug print
                 let mut lines: Vec<String> = get_saved_paths_string()
                     .lines()
                     .map(|s| s.trim().to_string())

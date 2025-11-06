@@ -113,7 +113,7 @@ extern "C" fn hotkey_handler(
     _event: EventRef,
     _user_data: *mut std::ffi::c_void,
 ) -> OSStatus {
-    eprintln!("[hotkey] pressed event received");
+    // removed noisy debug print
     if let Some(proxy) = EVENT_PROXY.get() {
         let _ = proxy.send_event(Event::new(EventType::ToggleAllWindows, None));
     }
@@ -137,7 +137,7 @@ fn ensure_handler_installed() {
             ptr::null_mut(),
             &mut handler_ref1 as *mut _,
         );
-        eprintln!("[hotkey] handler(app) install status: {}", status1);
+        // removed noisy debug print
 
         let mut handler_ref2: EventHandlerRef = ptr::null_mut();
         let status2 = InstallEventHandler(
@@ -148,7 +148,7 @@ fn ensure_handler_installed() {
             ptr::null_mut(),
             &mut handler_ref2 as *mut _,
         );
-        eprintln!("[hotkey] handler(dispatch) install status: {}", status2);
+        // removed noisy debug print
     }
 }
 
@@ -210,7 +210,7 @@ fn install_global_monitor_for_combo(code: u16, carbon_mods: u32) {
             ptr::null_mut(),
         );
         if tap.is_null() {
-            eprintln!("[hotkey] CGEventTapCreate failed (need '输入监控' 权限?)");
+            // removed noisy debug print
             return;
         }
         let src = CFMachPortCreateRunLoopSource(ptr::null(), tap, 0);
@@ -218,7 +218,7 @@ fn install_global_monitor_for_combo(code: u16, carbon_mods: u32) {
         CFRunLoopAddSource(rl, src, kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);
         GLOBAL_MONITOR.store(tap, Ordering::SeqCst);
-        eprintln!("[hotkey] CGEventTap installed (code={} mods={})", code, carbon_mods);
+        // removed noisy debug print
     }
 }
 
@@ -244,7 +244,7 @@ pub fn register_hotkey_keycode(key_code: i64) {
             0,
             &mut hk_ref as *mut _,
         );
-        eprintln!("[hotkey] register key={} mods=0 status={} (keycode)", key_code, status);
+        // removed noisy debug print
         HOTKEY_REF.store(hk_ref as *mut _, Ordering::SeqCst);
     }
     // 同步安装全局事件监控作为兜底
@@ -273,7 +273,7 @@ pub fn register_hotkey_combo(key_code: i64, modifiers: u32) {
             0,
             &mut hk_ref as *mut _,
         );
-        eprintln!("[hotkey] register key={} mods={} status={}", key_code, modifiers, status);
+        // removed noisy debug print
         HOTKEY_REF.store(hk_ref as *mut _, Ordering::SeqCst);
     }
     // 安装全局监控兜底（后台也能收到）
