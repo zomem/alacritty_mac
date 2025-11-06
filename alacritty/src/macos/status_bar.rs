@@ -964,6 +964,16 @@ pub unsafe fn open_config_window() {
     assert!(MainThreadMarker::new().is_some());
     let existing = CONFIG_WINDOW_PTR.load(Ordering::Relaxed);
     if !existing.is_null() {
+        // 确保已存在的配置窗口也会移动到当前桌面
+        if msg_send![existing, respondsToSelector: sel!(setCollectionBehavior:)]
+            && msg_send![existing, respondsToSelector: sel!(collectionBehavior)]
+        {
+            let existing_flags: u64 = msg_send![existing, collectionBehavior];
+            let move_to_active_space: u64 = 1u64 << 1; // MoveToActiveSpace
+            let transient: u64 = 1u64 << 3;           // Transient
+            let combined = existing_flags | move_to_active_space | transient;
+            let _: () = msg_send![existing, setCollectionBehavior: combined];
+        }
         let _: () = msg_send![existing, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![existing, center];
         update_config_table();
@@ -994,6 +1004,18 @@ pub unsafe fn open_config_window() {
     let _: () = msg_send![win, setTitle: &*title];
     // 关闭时不释放对象，避免持有的全局指针悬挂
     let _: () = msg_send![win, setReleasedWhenClosed: false];
+
+    // 确保“配置”窗口也在当前桌面（Space）显示
+    // 通过设置 NSWindowCollectionBehaviorMoveToActiveSpace | NSWindowCollectionBehaviorTransient
+    if msg_send![win, respondsToSelector: sel!(setCollectionBehavior:)]
+        && msg_send![win, respondsToSelector: sel!(collectionBehavior)]
+    {
+        let existing: u64 = msg_send![win, collectionBehavior];
+        let move_to_active_space: u64 = 1u64 << 1; // MoveToActiveSpace
+        let transient: u64 = 1u64 << 3;           // Transient
+        let combined = existing | move_to_active_space | transient;
+        let _: () = msg_send![win, setCollectionBehavior: combined];
+    }
 
     // 内容视图
     let content_view: *mut AnyObject = msg_send![win, contentView];
