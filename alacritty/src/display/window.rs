@@ -200,6 +200,31 @@ impl Window {
         #[cfg(target_os = "macos")]
         use_srgb_color_space(&window);
 
+        // macOS：确保窗口在激活时移动到当前桌面（Space），避免固定在某个桌面。
+        // 通过设置 NSWindowCollectionBehaviorMoveToActiveSpace | NSWindowCollectionBehaviorTransient。
+        #[cfg(target_os = "macos")]
+        {
+            match window.window_handle().unwrap().as_raw() {
+                RawWindowHandle::AppKit(handle) => unsafe {
+                    let view = handle.ns_view.cast::<NSView>().as_ref();
+                    let ns_window = view.window().unwrap();
+                    let ns_ptr = (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
+                        as *mut objc2_app_kit::NSWindow)
+                        .cast::<AnyObject>();
+                    if objc2::msg_send![ns_ptr, respondsToSelector: objc2::sel!(setCollectionBehavior:)]
+                        && objc2::msg_send![ns_ptr, respondsToSelector: objc2::sel!(collectionBehavior)]
+                    {
+                        let existing: u64 = objc2::msg_send![ns_ptr, collectionBehavior];
+                        let move_to_active_space: u64 = 1u64 << 1; // NSWindowCollectionBehaviorMoveToActiveSpace
+                        let transient: u64 = 1u64 << 3; // NSWindowCollectionBehaviorTransient
+                        let combined = existing | move_to_active_space | transient;
+                        let _: () = objc2::msg_send![ns_ptr, setCollectionBehavior: combined];
+                    }
+                },
+                _ => {}
+            }
+        }
+
         // macOS：不为每个窗口创建独立状态栏项，仅保留全局主状态栏。
 
         let scale_factor = window.scale_factor();
@@ -267,6 +292,16 @@ impl Window {
                 let ns_ptr = (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
                     as *mut objc2_app_kit::NSWindow)
                     .cast::<AnyObject>();
+                // 确保窗口在当前桌面显示
+                if objc2::msg_send![ns_ptr, respondsToSelector: objc2::sel!(setCollectionBehavior:)]
+                    && objc2::msg_send![ns_ptr, respondsToSelector: objc2::sel!(collectionBehavior)]
+                {
+                    let existing: u64 = objc2::msg_send![ns_ptr, collectionBehavior];
+                    let move_to_active_space: u64 = 1u64 << 1;
+                    let transient: u64 = 1u64 << 3;
+                    let combined = existing | move_to_active_space | transient;
+                    let _: () = objc2::msg_send![ns_ptr, setCollectionBehavior: combined];
+                }
                 let _: () = objc2::msg_send![ns_ptr, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
             },
             _ => {}
@@ -301,6 +336,16 @@ impl Window {
                 let ns_ptr = (objc2::rc::Retained::<objc2_app_kit::NSWindow>::as_ptr(&ns_window)
                     as *mut objc2_app_kit::NSWindow)
                     .cast::<AnyObject>();
+                // 确保窗口在当前桌面显示
+                if objc2::msg_send![ns_ptr, respondsToSelector: objc2::sel!(setCollectionBehavior:)]
+                    && objc2::msg_send![ns_ptr, respondsToSelector: objc2::sel!(collectionBehavior)]
+                {
+                    let existing: u64 = objc2::msg_send![ns_ptr, collectionBehavior];
+                    let move_to_active_space: u64 = 1u64 << 1;
+                    let transient: u64 = 1u64 << 3;
+                    let combined = existing | move_to_active_space | transient;
+                    let _: () = objc2::msg_send![ns_ptr, setCollectionBehavior: combined];
+                }
                 let _: () = objc2::msg_send![ns_ptr, orderFront: std::ptr::null::<AnyObject>()];
             },
             _ => {}
