@@ -2269,11 +2269,13 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                                     crate::daemon::foreground_process_path(self.ctx.master_fd, self.ctx.shell_pid)
                                 {
                                     let title = path.to_string_lossy().into_owned();
+                                    let title = crate::path_util::shorten_home(&title);
                                     self.ctx.window().set_title(title);
                                 } else {
                                     // 回退到原行为（使用终端上报的标题）。
                                     // 注意：这里 _title 可能包含非目录信息，但作为兜底更安全。
-                                    self.ctx.window().set_title(_title);
+                                    let title = crate::path_util::shorten_home(&_title);
+                                    self.ctx.window().set_title(title);
                                 }
                             }
                             #[cfg(windows)]
@@ -2292,6 +2294,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                                     crate::daemon::foreground_process_path(self.ctx.master_fd, self.ctx.shell_pid)
                                 {
                                     let title = path.to_string_lossy().into_owned();
+                                    let title = crate::path_util::shorten_home(&title);
                                     self.ctx.display.window.set_title(title);
                                 } else {
                                     // 获取失败则回退到配置标题。
@@ -2435,6 +2438,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                                 crate::daemon::foreground_process_path(self.ctx.master_fd, self.ctx.shell_pid)
                             {
                                 let title = path.to_string_lossy().into_owned();
+                                let title = crate::path_util::shorten_home(&title);
                                 self.ctx.window().set_title(title);
                             }
                         }

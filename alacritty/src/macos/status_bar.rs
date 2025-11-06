@@ -371,7 +371,9 @@ fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
         for line in saved.lines() {
             let p = line.trim();
             if p.is_empty() { continue; }
-            let title = NSString::from_str(p);
+            // 菜单标题展示 `~`，但 representedObject 保留绝对路径
+            let display = crate::path_util::shorten_home(p);
+            let title = NSString::from_str(&display);
             let empty_key = NSString::from_str("");
             let mi_alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
             let mi: *mut AnyObject = msg_send![
@@ -585,12 +587,20 @@ fn set_saved_paths_string(s: &str) {
     }
 }
 
+// 路径展示遵循全局工具：crate::path_util::shorten_home
+
 fn update_config_textview() {
     unsafe {
         let tv = CONFIG_TEXTVIEW_PTR.load(Ordering::Relaxed);
         if tv.is_null() { return; }
         let content = get_saved_paths_string();
-        let ns = NSString::from_str(&content);
+        // 展示时将 HOME 前缀替换为 `~`
+        let display = content
+            .lines()
+            .map(|s| crate::path_util::shorten_home(s.trim()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ns = NSString::from_str(&display);
         let _: () = msg_send![tv, setString: &*ns];
     }
 }

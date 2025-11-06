@@ -185,6 +185,7 @@ impl WindowContext {
         #[cfg(not(windows))]
         if let Some(ref dir) = pty_config.working_directory {
             let title = dir.to_string_lossy().into_owned();
+            let title = crate::path_util::shorten_home(&title);
             display.window.set_title(title);
         }
 
@@ -223,6 +224,7 @@ impl WindowContext {
         if pty_config.working_directory.is_none() {
             if let Ok(path) = foreground_process_path(master_fd, shell_pid) {
                 let title = path.to_string_lossy().into_owned();
+                let title = crate::path_util::shorten_home(&title);
                 display.window.set_title(title);
             }
         }
@@ -286,6 +288,7 @@ impl WindowContext {
     pub fn update_title_from_foreground_cwd(&mut self) {
         if let Ok(path) = foreground_process_path(self.master_fd, self.shell_pid) {
             let title = path.to_string_lossy().into_owned();
+            let title = crate::path_util::shorten_home(&title);
             if self.last_cwd_title.as_deref() != Some(&title) {
                 self.display.window.set_title(title.clone());
                 self.last_cwd_title = Some(title);

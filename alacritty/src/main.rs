@@ -46,6 +46,7 @@ mod panic;
 mod renderer;
 mod scheduler;
 mod string;
+mod path_util;
 mod window_context;
 
 mod gl {
