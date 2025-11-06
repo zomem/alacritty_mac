@@ -11,6 +11,7 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::cli::WindowOptions;
 use crate::event::{Event, EventType};
+use std::path::PathBuf;
 
 // 全局保存指针（原生指针是线程安全可共享的）。
 // 兼容旧实现的全局指针（不再作为逻辑依据，仅做向后兼容）。
@@ -168,11 +169,33 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             unsafe { super::status_bar::pick_and_append_folder_path(); }
         }
 
+        extern "C" fn on_open_saved_path(_this: &AnyObject, _sel: Sel, sender: *mut AnyObject) {
+            // 从菜单项的 representedObject 取出路径字符串，在该目录新建窗口
+            unsafe {
+                if sender.is_null() { return; }
+                let robj: *mut AnyObject = msg_send![sender, representedObject];
+                if robj.is_null() { return; }
+                let c_ptr: *const std::ffi::c_char = msg_send![robj, UTF8String];
+                if c_ptr.is_null() { return; }
+                let path = unsafe { std::ffi::CStr::from_ptr(c_ptr) }
+                    .to_string_lossy()
+                    .into_owned();
+
+                if let Some(proxy) = EVENT_PROXY.get() {
+                    let mut opts = WindowOptions::default();
+                    opts.terminal_options.working_directory = Some(PathBuf::from(path));
+                    let _ = proxy.send_event(Event::new(EventType::CreateWindow(opts), None));
+                    let _ = proxy.send_event(Event::new(EventType::ShowAllWindows, None));
+                }
+            }
+        }
+
         unsafe {
             builder.add_method(sel!(onStatusItemClick:), on_click as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemNewWindow:), on_new_window as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemOpenConfig:), on_open_config as extern "C" fn(_, _, _));
             builder.add_method(sel!(onConfigAddPath:), on_config_add_path as extern "C" fn(_, _, _));
+            builder.add_method(sel!(onStatusItemOpenSavedPath:), on_open_saved_path as extern "C" fn(_, _, _));
         }
 
         let cls = builder.register();
@@ -332,6 +355,35 @@ fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
     unsafe {
         // 创建菜单
         let menu: *mut AnyObject = msg_send![class!(NSMenu), new];
+
+        // 动态插入：已保存的目录（在列表顶部）
+        let saved = get_saved_paths_string();
+        let mut added_any = false;
+        for line in saved.lines() {
+            let p = line.trim();
+            if p.is_empty() { continue; }
+            let title = NSString::from_str(p);
+            let empty_key = NSString::from_str("");
+            let mi_alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+            let mi: *mut AnyObject = msg_send![
+                mi_alloc,
+                initWithTitle: &*title,
+                action: sel!(onStatusItemOpenSavedPath:),
+                keyEquivalent: &*empty_key
+            ];
+            // 把原始路径放入 representedObject，供回调取用
+            let rep = NSString::from_str(p);
+            let _: () = msg_send![mi, setRepresentedObject: &*rep];
+            let _: () = msg_send![mi, setTarget: target];
+            let _: () = msg_send![menu, addItem: mi];
+            added_any = true;
+        }
+
+        // 顶部列表与常规项之间加一条分隔线（如有目录）
+        if added_any {
+            let sep: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
+            let _: () = msg_send![menu, addItem: sep];
+        }
 
         // 新建窗口菜单项
         let title = NSString::from_str("新建窗口");
@@ -518,6 +570,21 @@ fn update_config_textview() {
     }
 }
 
+/// 重新为所有状态栏项重建右键菜单（用于添加/更新目录后生效）。
+fn rebuild_all_context_menus() {
+    HANDLER_MAP.with(|map| {
+        let mut map = map.borrow_mut();
+        // 收集键以避免借用冲突
+        let keys: Vec<*mut AnyObject> = map.keys().copied().collect();
+        for handler_ptr in keys {
+            if let Some(rec) = map.get_mut(&handler_ptr) {
+                let new_menu = build_context_menu_for_target(handler_ptr);
+                rec.menu = new_menu;
+            }
+        }
+    });
+}
+
 /// 选择目录并追加到记录
 pub unsafe fn pick_and_append_folder_path() {
     // NSOpenPanel
@@ -539,7 +606,7 @@ pub unsafe fn pick_and_append_folder_path() {
     if path_ns.is_null() { return; }
     let c_ptr: *const std::ffi::c_char = msg_send![path_ns, UTF8String];
     if c_ptr.is_null() { return; }
-    let path = std::ffi::CStr::from_ptr(c_ptr).to_string_lossy().into_owned();
+    let path = unsafe { std::ffi::CStr::from_ptr(c_ptr) }.to_string_lossy().into_owned();
 
     // 读取现有并去重追加
     let mut lines: Vec<String> = get_saved_paths_string()
@@ -553,6 +620,8 @@ pub unsafe fn pick_and_append_folder_path() {
     let new_content = lines.join("\n");
     set_saved_paths_string(&new_content);
     update_config_textview();
+    // 列表改变后，重建所有右键菜单
+    rebuild_all_context_menus();
 }
 
 /// 打开（或聚焦）配置窗口
