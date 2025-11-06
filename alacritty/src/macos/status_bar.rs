@@ -1,7 +1,7 @@
 use objc2::{MainThreadMarker, class, msg_send, sel};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Sel};
-use objc2_foundation::NSString;
+use objc2_foundation::{NSString, NSRect, NSPoint, NSSize, NSUserDefaults};
 use objc2_app_kit::{NSApplication, NSStatusBar, NSStatusItem, NSMenu, NSMenuItem};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -18,6 +18,9 @@ static STATUS_ITEM_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut
 static NSWINDOW_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 static MENU_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 static EVENT_PROXY: OnceLock<EventLoopProxy<Event>> = OnceLock::new();
+// 配置窗口与内容视图控件指针
+static CONFIG_WINDOW_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
+static CONFIG_TEXTVIEW_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 // 记录所有已创建的 NSWindow 指针，用于统一显示/隐藏。
 // 记录我们创建的标题栏视图，避免重复创建（可为空）。
 //
@@ -155,9 +158,21 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             }
         }
 
+        extern "C" fn on_open_config(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+            // 打开配置窗口
+            unsafe { super::status_bar::open_config_window(); }
+        }
+
+        extern "C" fn on_config_add_path(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+            // 打开系统文件夹选择对话框，选择文件夹并追加保存
+            unsafe { super::status_bar::pick_and_append_folder_path(); }
+        }
+
         unsafe {
             builder.add_method(sel!(onStatusItemClick:), on_click as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemNewWindow:), on_new_window as extern "C" fn(_, _, _));
+            builder.add_method(sel!(onStatusItemOpenConfig:), on_open_config as extern "C" fn(_, _, _));
+            builder.add_method(sel!(onConfigAddPath:), on_config_add_path as extern "C" fn(_, _, _));
         }
 
         let cls = builder.register();
@@ -331,6 +346,18 @@ fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
         let _: () = msg_send![mi, setTarget: target];
         let _: () = msg_send![menu, addItem: mi];
 
+        // 配置菜单项
+        let cfg_title = NSString::from_str("配置");
+        let mi2_alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let mi2: *mut AnyObject = msg_send![
+            mi2_alloc,
+            initWithTitle: &*cfg_title,
+            action: sel!(onStatusItemOpenConfig:),
+            keyEquivalent: &*empty_key
+        ];
+        let _: () = msg_send![mi2, setTarget: target];
+        let _: () = msg_send![menu, addItem: mi2];
+
         menu
     }
 }
@@ -446,5 +473,178 @@ pub fn create_global_status_item(title: &str) {
     MENU_PTR.store(menu, Ordering::Relaxed);
 
     std::mem::forget(item);
+    std::mem::forget(handler);
+}
+
+//
+// 配置窗口与路径记录逻辑
+//
+
+fn get_saved_paths_string() -> String {
+    unsafe {
+        let defs = NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("AlacrittyFolderPaths");
+        let s_obj: *mut AnyObject = msg_send![&*defs, stringForKey: &*key];
+        if s_obj.is_null() {
+            return String::new();
+        }
+        let c_ptr: *const std::ffi::c_char = msg_send![s_obj, UTF8String];
+        if c_ptr.is_null() {
+            String::new()
+        } else {
+            let s = unsafe { std::ffi::CStr::from_ptr(c_ptr) };
+            s.to_string_lossy().into_owned()
+        }
+    }
+}
+
+fn set_saved_paths_string(s: &str) {
+    unsafe {
+        let defs = NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("AlacrittyFolderPaths");
+        let val = NSString::from_str(s);
+        let _: () = msg_send![&*defs, setObject: &*val, forKey: &*key];
+        let _: bool = msg_send![&*defs, synchronize];
+    }
+}
+
+fn update_config_textview() {
+    unsafe {
+        let tv = CONFIG_TEXTVIEW_PTR.load(Ordering::Relaxed);
+        if tv.is_null() { return; }
+        let content = get_saved_paths_string();
+        let ns = NSString::from_str(&content);
+        let _: () = msg_send![tv, setString: &*ns];
+    }
+}
+
+/// 选择目录并追加到记录
+pub unsafe fn pick_and_append_folder_path() {
+    // NSOpenPanel
+    let panel: *mut AnyObject = msg_send![class!(NSOpenPanel), openPanel];
+    if panel.is_null() { return; }
+    let _: () = msg_send![panel, setCanChooseFiles: false];
+    let _: () = msg_send![panel, setCanChooseDirectories: true];
+    let _: () = msg_send![panel, setAllowsMultipleSelection: false];
+    let title = NSString::from_str("选择文件夹");
+    let _: () = msg_send![panel, setTitle: &*title];
+
+    let resp: i64 = msg_send![panel, runModal];
+    // NSModalResponseOK == 1
+    if resp != 1 { return; }
+
+    let url: *mut AnyObject = msg_send![panel, URL];
+    if url.is_null() { return; }
+    let path_ns: *mut AnyObject = msg_send![url, path];
+    if path_ns.is_null() { return; }
+    let c_ptr: *const std::ffi::c_char = msg_send![path_ns, UTF8String];
+    if c_ptr.is_null() { return; }
+    let path = std::ffi::CStr::from_ptr(c_ptr).to_string_lossy().into_owned();
+
+    // 读取现有并去重追加
+    let mut lines: Vec<String> = get_saved_paths_string()
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !lines.iter().any(|s| s == &path) {
+        lines.push(path);
+    }
+    let new_content = lines.join("\n");
+    set_saved_paths_string(&new_content);
+    update_config_textview();
+}
+
+/// 打开（或聚焦）配置窗口
+pub unsafe fn open_config_window() {
+    assert!(MainThreadMarker::new().is_some());
+    let existing = CONFIG_WINDOW_PTR.load(Ordering::Relaxed);
+    if !existing.is_null() {
+        let _: () = msg_send![existing, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![existing, center];
+        update_config_textview();
+        return;
+    }
+
+    // 创建窗口
+    let w_alloc: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+    // 520x380 窗口
+    let frame = NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 520.0, height: 380.0 } };
+    let titled: u64 = 1u64 << 0; // NSWindowStyleMaskTitled
+    let closable: u64 = 1u64 << 1; // NSWindowStyleMaskClosable
+    let miniaturizable: u64 = 1u64 << 2; // NSWindowStyleMaskMiniaturizable
+    let resizable: u64 = 1u64 << 3; // NSWindowStyleMaskResizable
+    let style_mask = titled | closable | miniaturizable | resizable;
+    let backing_buffered: u64 = 2; // NSBackingStoreBuffered
+    let win: *mut AnyObject = msg_send![
+        w_alloc,
+        initWithContentRect: frame,
+        styleMask: style_mask,
+        backing: backing_buffered,
+        defer: false
+    ];
+    if win.is_null() { return; }
+
+    // 标题
+    let title = NSString::from_str("配置");
+    let _: () = msg_send![win, setTitle: &*title];
+    // 关闭时不释放对象，避免持有的全局指针悬挂
+    let _: () = msg_send![win, setReleasedWhenClosed: false];
+
+    // 内容视图
+    let content_view: *mut AnyObject = msg_send![win, contentView];
+    if content_view.is_null() { return; }
+    let cv_frame: NSRect = msg_send![content_view, frame];
+    let pad: f64 = 16.0;
+    let btn_h: f64 = 28.0;
+    let btn_w: f64 = 80.0;
+
+    // 计算布局
+    let btn_x = 16.0f64;
+    let btn_y = cv_frame.size.height - pad - btn_h;
+    let btn_frame = NSRect { origin: NSPoint { x: btn_x, y: btn_y }, size: NSSize { width: btn_w, height: btn_h } };
+
+    let scroll_x = pad;
+    let scroll_y = pad;
+    let scroll_w = cv_frame.size.width - 2.0 * pad;
+    let scroll_h = cv_frame.size.height - (3.0 * pad) - btn_h;
+    let scroll_frame = NSRect { origin: NSPoint { x: scroll_x, y: scroll_y }, size: NSSize { width: scroll_w, height: scroll_h } };
+
+    // 按钮：添加
+    let btn_title = NSString::from_str("添加");
+    let button: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let button: *mut AnyObject = msg_send![button, initWithFrame: btn_frame];
+    let _: () = msg_send![button, setTitle: &*btn_title];
+    // 绑定 target/action
+    let cls = ensure_click_handler_class();
+    let handler: Retained<AnyObject> = msg_send![cls, new];
+    let _: () = msg_send![button, setTarget: &*handler];
+    let _: () = msg_send![button, setAction: sel!(onConfigAddPath:)];
+
+    // 滚动 + 文本视图显示路径列表
+    let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
+    let scroll: *mut AnyObject = msg_send![scroll, initWithFrame: scroll_frame];
+    let text: *mut AnyObject = msg_send![class!(NSTextView), alloc];
+    let text: *mut AnyObject = msg_send![text, initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: scroll_w, height: scroll_h } }];
+    let _: () = msg_send![text, setEditable: false];
+    let _: () = msg_send![scroll, setHasVerticalScroller: true];
+    let _: () = msg_send![scroll, setDocumentView: text];
+
+    // 添加子视图
+    let _: () = msg_send![content_view, addSubview: scroll];
+    let _: () = msg_send![content_view, addSubview: button];
+
+    // 保存全局指针并设置初始内容
+    CONFIG_WINDOW_PTR.store(win, Ordering::Relaxed);
+    CONFIG_TEXTVIEW_PTR.store(text, Ordering::Relaxed);
+    update_config_textview();
+
+    // 显示窗口
+    let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
+    let _: () = msg_send![app, activateIgnoringOtherApps: true];
+    let _: () = msg_send![win, center];
+    let _: () = msg_send![win, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+
+    // 防止 handler 释放
     std::mem::forget(handler);
 }
