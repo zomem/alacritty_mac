@@ -537,6 +537,18 @@ impl WindowContext {
         self.display.window.id()
     }
 
+    /// 设置窗口是否被遮挡/不可见（供平台侧主动更新）。
+    #[inline]
+    pub fn set_occluded(&mut self, occluded: bool) {
+        self.occluded = occluded;
+    }
+
+    /// 查询窗口是否被遮挡。
+    #[inline]
+    pub fn is_occluded(&self) -> bool {
+        self.occluded
+    }
+
     /// 是否处于聚焦状态（基于 terminal 的焦点状态）。
     pub fn is_focused(&self) -> bool {
         self.terminal.lock().is_focused

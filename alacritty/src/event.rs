@@ -673,6 +673,10 @@ impl ApplicationHandler<Event> for Processor {
                 if show {
                     // 统一调用恢复逻辑，确保系统菜单/快捷键恢复时也一致。
                     self.restore_z_order_and_show();
+                    // 显示后，标记为未遮挡，避免 AboutToWait 阶段误触发 redraw 节流。
+                    for wc in self.windows.values_mut() {
+                        wc.set_occluded(false);
+                    }
                 } else {
                     // 在隐藏过程中，可能伴随 AppKit 触发的一系列焦点变化事件；
                     // 这里先短暂抑制“焦点导致的重排”，避免污染我们记录的顺序。
@@ -683,8 +687,10 @@ impl ApplicationHandler<Event> for Processor {
                     if self.window_z_order.len() != self.windows.len() || self.window_z_order.is_empty() {
                         self.capture_current_z_order_from_appkit();
                     }
-                    for window_context in self.windows.values() {
+                    for window_context in self.windows.values_mut() {
                         window_context.display.window.order_out();
+                        // 主动标记为遮挡，避免隐藏后还触发 redraw 请求。
+                        window_context.set_occluded(true);
                     }
                     self.pending_auto_hide_eval = false;
                     self.suppress_auto_hide_until = None;
@@ -702,6 +708,9 @@ impl ApplicationHandler<Event> for Processor {
                 #[cfg(target_os = "macos")]
                 {
                     self.restore_z_order_and_show();
+                    for wc in self.windows.values_mut() {
+                        wc.set_occluded(false);
+                    }
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -799,7 +808,7 @@ impl ApplicationHandler<Event> for Processor {
             (EventType::Frame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.display.window.has_frame = true;
-                    if window_context.dirty {
+                    if window_context.dirty && !window_context.is_occluded() {
                         window_context.display.window.request_redraw();
                     }
                 }
@@ -845,17 +854,24 @@ impl ApplicationHandler<Event> for Processor {
                 }
 
                 if !is_active && !suppressed {
-                    // 同理：准备隐藏前抑制短时间内的焦点重排。
-                    self.suppress_focus_reorder_until = Some(Instant::now() + Duration::from_millis(400));
-                    // 应用失活准备隐藏前，如记录不完整则同步记录一次真实层级顺序；
-                    // 否则保留上次聚焦顺序，避免系统窗口干扰。
-                    if self.window_z_order.len() != self.windows.len() || self.window_z_order.is_empty() {
-                        self.capture_current_z_order_from_appkit();
+                    // 仅当当前处于“显示状态”时执行一次隐藏，避免重复 orderOut 触发不必要事件/唤醒。
+                    if self.windows_shown {
+                        // 同理：准备隐藏前抑制短时间内的焦点重排。
+                        self.suppress_focus_reorder_until =
+                            Some(Instant::now() + Duration::from_millis(400));
+                        // 应用失活准备隐藏前，如记录不完整则同步记录一次真实层级顺序；
+                        // 否则保留上次聚焦顺序，避免系统窗口干扰。
+                        if self.window_z_order.len() != self.windows.len()
+                            || self.window_z_order.is_empty()
+                        {
+                            self.capture_current_z_order_from_appkit();
+                        }
+                        for wc in self.windows.values_mut() {
+                            wc.display.window.order_out();
+                            wc.set_occluded(true);
+                        }
+                        self.windows_shown = false;
                     }
-                    for wc in self.windows.values() {
-                        wc.display.window.order_out();
-                    }
-                    self.windows_shown = false;
                 }
 
                 // 若刚从非激活切换为激活（例如通过 Dock/菜单“显示”恢复），
@@ -868,6 +884,9 @@ impl ApplicationHandler<Event> for Processor {
                     let activated_by_config = crate::macos::status_bar::config_window_is_key_window();
                     if !(suppressed_once || activated_by_config) {
                         self.restore_z_order_and_show();
+                        for wc in self.windows.values_mut() {
+                            wc.set_occluded(false);
+                        }
                     }
                 }
 
