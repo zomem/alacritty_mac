@@ -86,11 +86,11 @@ impl Options {
         // Parse CLI config overrides.
         options.config_options = options.window_options.config_overrides();
 
-        // macOS: 默认以 daemon 方式启动，不自动创建首个窗口，且在关闭所有窗口后不退出。
-        // 注：如需在启动时立即创建窗口，可在运行中通过菜单栏操作创建。
+        // macOS: 默认启动时自动创建首个窗口（命令窗）。
+        // 不再默认以 daemon 方式运行，以符合“始终至少一个窗口”的期望。
         #[cfg(target_os = "macos")]
         {
-            options.daemon = true;
+            options.daemon = false;
         }
 
         options

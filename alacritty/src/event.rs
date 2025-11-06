@@ -774,14 +774,25 @@ impl ApplicationHandler<Event> for Processor {
                 // Unschedule pending events.
                 self.scheduler.unschedule_window(window_context.id());
 
-                // Shutdown if no more terminals are open.
+                // 当关闭的是最后一个窗口时，自动新建一个窗口，保证始终至少有一个窗口。
                 if self.windows.is_empty() && !self.cli_options.daemon {
-                    // Write ref tests of last window to disk.
+                    // 写入最后窗口的参考测试结果（如启用）。
                     if self.config.debug.ref_test {
                         window_context.write_ref_test_results();
                     }
 
-                    event_loop.exit();
+                    // 使用启动时相同的窗口选项新建一个“命令窗口”。
+                    let options = self.cli_options.window_options.clone();
+                    if let Err(err) = match self.gl_config {
+                        // 若 GL 平台尚未初始化（理论上不会发生，因为已有窗口），
+                        // 走 initial 分支以确保正确初始化。
+                        None => self.create_initial_window(event_loop, options),
+                        Some(_) => self.create_window(event_loop, options),
+                    } {
+                        error!("Could not recreate window after last closed: {err:?}");
+                        // 若创建失败则退出，避免事件循环无窗口卡死。
+                        event_loop.exit();
+                    }
                 }
             },
             // NOTE: This event bypasses batching to minimize input latency.
