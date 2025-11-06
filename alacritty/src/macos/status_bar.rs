@@ -237,6 +237,71 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             unsafe { super::status_bar::pick_and_append_folder_path(); }
         }
 
+        // 配置窗口：添加“文本”行（显示在菜单列表顶部，不可点击）
+        extern "C" fn on_config_add_text(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+            unsafe {
+                // 使用 NSAlert + accessory NSTextField 询问文本
+                let alert: *mut AnyObject = msg_send![class!(NSAlert), alloc];
+                let alert: *mut AnyObject = msg_send![alert, init];
+                if alert.is_null() { return; }
+
+                let msg = NSString::from_str("添加文本");
+                let info = NSString::from_str("输入将显示在菜单栏列表中，且不可点击");
+                let _: () = msg_send![alert, setMessageText: &*msg];
+                let _: () = msg_send![alert, setInformativeText: &*info];
+
+                // 添加按钮：确定 / 取消（第一个按钮返回 1000）
+                let ok = NSString::from_str("确定");
+                let cancel = NSString::from_str("取消");
+                let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: &*ok];
+                let _: *mut AnyObject = msg_send![alert, addButtonWithTitle: &*cancel];
+
+                // 输入框
+                let tf: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+                let tf: *mut AnyObject = msg_send![
+                    tf,
+                    initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 300.0, height: 22.0 } }
+                ];
+                let _: () = msg_send![tf, setStringValue: &*NSString::from_str("")];
+                let _: () = msg_send![alert, setAccessoryView: tf];
+
+                let resp: i64 = msg_send![alert, runModal];
+                if resp != 1000 { return; }
+
+                // 读取文本
+                let text_obj: *mut AnyObject = msg_send![tf, stringValue];
+                if text_obj.is_null() { return; }
+                let c_ptr: *const std::ffi::c_char = msg_send![text_obj, UTF8String];
+                if c_ptr.is_null() { return; }
+                let mut s = std::ffi::CStr::from_ptr(c_ptr).to_string_lossy().into_owned();
+                s = s.trim().to_string();
+                if s.is_empty() { return; }
+                // 避免重复的前缀：若用户手动输入了 text: 前缀，则去掉
+                let s_norm = if let Some(rest) = s.strip_prefix("text:") { rest.trim().to_string() } else { s };
+
+                // 计算插入位置：选中行后插入；若未选中则追加到末尾
+                let table = CONFIG_TABLE_PTR.load(Ordering::Relaxed);
+                let mut lines: Vec<String> = get_saved_paths_string()
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                let mut insert_at = lines.len();
+                if !table.is_null() {
+                    let row: isize = msg_send![table, selectedRow];
+                    if row >= 0 {
+                        let idx = row as usize;
+                        if idx <= lines.len() { insert_at = idx.saturating_add(1); }
+                    }
+                }
+                if insert_at > lines.len() { insert_at = lines.len(); }
+                lines.insert(insert_at, format!("text:{}", s_norm));
+                set_saved_paths_string(&lines.join("\n"));
+                update_config_table();
+                rebuild_all_context_menus();
+            }
+        }
+
         extern "C" fn on_open_saved_path(_this: &AnyObject, _sel: Sel, sender: *mut AnyObject) {
             // 从菜单项的 representedObject 取出路径字符串，在该目录新建窗口
             unsafe {
@@ -319,7 +384,13 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                 let idx = if row < 0 { 0 } else { row as usize };
                 let text_str = if idx < lines.len() {
                     let raw = lines[idx].trim();
-                    if raw == "---" { "── 分隔线 ──".to_string() } else { crate::path_util::shorten_home(raw) }
+                    if raw == "---" {
+                        "── 分隔线 ──".to_string()
+                    } else if let Some(rest) = raw.strip_prefix("text:") {
+                        rest.trim().to_string()
+                    } else {
+                        crate::path_util::shorten_home(raw)
+                    }
                 } else {
                     String::new()
                 };
@@ -546,6 +617,7 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             builder.add_method(sel!(onRowDelete:), on_row_delete as extern "C" fn(_, _, _));
             builder.add_method(sel!(onConfigRemoveSelected:), on_config_remove_selected as extern "C" fn(_, _, _));
             builder.add_method(sel!(onConfigAddSeparator:), on_config_add_separator as extern "C" fn(_, _, _));
+            builder.add_method(sel!(onConfigAddText:), on_config_add_text as extern "C" fn(_, _, _));
         }
 
         let cls = builder.register();
@@ -908,6 +980,24 @@ fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
                 let sep_item: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
                 let _: () = msg_send![menu, addItem: sep_item];
                 // 分隔线不计入“是否添加了可点击项”
+                continue;
+            }
+            // 以 text: 开头的行为“不可点击文本项”
+            if let Some(rest) = p.strip_prefix("text:") {
+                let text = rest.trim();
+                let title = NSString::from_str(text);
+                let empty_key = NSString::from_str("");
+                let mi_alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+                let mi: *mut AnyObject = msg_send![
+                    mi_alloc,
+                    initWithTitle: &*title,
+                    action: sel!(onStatusItemOpenSavedPath:),
+                    keyEquivalent: &*empty_key
+                ];
+                // 不可点击
+                let _: () = msg_send![mi, setEnabled: false];
+                let _: () = msg_send![menu, addItem: mi];
+                added_any = true;
                 continue;
             }
             // 菜单标题展示 `~`，但 representedObject 保留绝对路径
@@ -1383,6 +1473,12 @@ pub unsafe fn open_config_window() {
     // “分隔线”按钮更宽一些，便于显示文字
     let sep_w: f64 = 64.0;
     let btn_frame_sep = NSRect { origin: NSPoint { x: btn_x + (btn_w + btn_gap) * 2.0, y: btn_y }, size: NSSize { width: sep_w, height: btn_h } };
+    // “文本”按钮尺寸与分隔线类似，放在其右侧
+    let txt_w: f64 = 64.0;
+    let btn_frame_txt = NSRect {
+        origin: NSPoint { x: btn_x + (btn_w + btn_gap) * 2.0 + sep_w + btn_gap, y: btn_y },
+        size: NSSize { width: txt_w, height: btn_h },
+    };
 
     let scroll_x = pad;
     // 底部预留按钮区
@@ -1434,6 +1530,19 @@ pub unsafe fn open_config_window() {
         // NSViewMaxXMargin | NSViewMaxYMargin
         let mask: u64 = (1u64 << 2) | (1u64 << 5);
         let _: () = msg_send![button_sep, setAutoresizingMask: mask];
+    }
+
+    // “文本”按钮（在选中行后插入 text:...）
+    let btn_title_txt = NSString::from_str("文本");
+    let button_txt: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let button_txt: *mut AnyObject = msg_send![button_txt, initWithFrame: btn_frame_txt];
+    let _: () = msg_send![button_txt, setTitle: &*btn_title_txt];
+    let _: () = msg_send![button_txt, setTarget: &*handler];
+    let _: () = msg_send![button_txt, setAction: sel!(onConfigAddText:)];
+    if msg_send![button_txt, respondsToSelector: sel!(setAutoresizingMask:)] {
+        // NSViewMaxXMargin | NSViewMaxYMargin
+        let mask: u64 = (1u64 << 2) | (1u64 << 5);
+        let _: () = msg_send![button_txt, setAutoresizingMask: mask];
     }
 
     // 滚动 + 表格视图显示路径列表
@@ -1564,6 +1673,7 @@ pub unsafe fn open_config_window() {
     let _: () = msg_send![content_view, addSubview: button_plus];
     let _: () = msg_send![content_view, addSubview: button_minus];
     let _: () = msg_send![content_view, addSubview: button_sep];
+    let _: () = msg_send![content_view, addSubview: button_txt];
 
     // 保存全局指针并设置初始内容
     CONFIG_WINDOW_PTR.store(win, Ordering::Relaxed);
