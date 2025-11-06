@@ -1,10 +1,10 @@
 use objc2::{MainThreadMarker, class, msg_send, sel};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Sel};
+use objc2::runtime::{AnyClass, AnyObject, Sel, Bool};
 use objc2_foundation::{NSString, NSRect, NSPoint, NSSize, NSUserDefaults};
 use objc2_app_kit::{NSApplication, NSStatusBar, NSStatusItem, NSMenu, NSMenuItem};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, AtomicIsize, Ordering};
 use std::cell::RefCell;
 use std::sync::OnceLock;
 use winit::event_loop::EventLoopProxy;
@@ -21,7 +21,8 @@ static MENU_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 static EVENT_PROXY: OnceLock<EventLoopProxy<Event>> = OnceLock::new();
 // 配置窗口与内容视图控件指针
 static CONFIG_WINDOW_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
-static CONFIG_TEXTVIEW_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
+static CONFIG_TABLE_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
+static DRAG_SOURCE_INDEX: AtomicIsize = AtomicIsize::new(-1);
 // 记录所有已创建的 NSWindow 指针，用于统一显示/隐藏。
 // 记录我们创建的标题栏视图，避免重复创建（可为空）。
 //
@@ -198,6 +199,216 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             }
         }
 
+        // NSTableView 数据源/委托 + 配置按钮行为
+        extern "C" fn number_of_rows_in_table(_this: &AnyObject, _sel: Sel, _table: *mut AnyObject) -> isize {
+            let content = get_saved_paths_string();
+            let count = content
+                .lines()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .count();
+            println!("[配置] 行数: {}", count);
+            count as isize
+        }
+
+        extern "C" fn table_view_view_for_col_row(
+            _this: &AnyObject,
+            _sel: Sel,
+            table: *mut AnyObject,
+            _col: *mut AnyObject,
+            row: isize,
+        ) -> *mut AnyObject {
+            unsafe {
+                // 取数据
+                let lines: Vec<String> = get_saved_paths_string()
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let idx = if row < 0 { 0 } else { row as usize };
+                let text_str = if idx < lines.len() {
+                    crate::path_util::shorten_home(&lines[idx])
+                } else {
+                    String::new()
+                };
+
+                // 复用/创建容器单元视图：仅左侧文本（删除改为底部统一按钮）
+                let ident = NSString::from_str("PathCell");
+                let mut cell: *mut AnyObject = msg_send![table, makeViewWithIdentifier: &*ident, owner: table];
+                if cell.is_null() {
+                    cell = msg_send![class!(NSTableCellView), alloc];
+                    cell = msg_send![cell, initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 10.0, height: 10.0 } }];
+                    let _: () = msg_send![cell, setIdentifier: &*ident];
+
+                    // 文本
+                    let text: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+                    let text: *mut AnyObject = msg_send![text, initWithFrame: NSRect { origin: NSPoint { x: 8.0, y: 0.0 }, size: NSSize { width: 100.0, height: 18.0 } }];
+                    let _: () = msg_send![text, setBordered: false];
+                    let _: () = msg_send![text, setEditable: false];
+                    let _: () = msg_send![text, setBezeled: false];
+                    if msg_send![text, respondsToSelector: sel!(setDrawsBackground:)] {
+                        let _: () = msg_send![text, setDrawsBackground: false];
+                    }
+                    if msg_send![text, respondsToSelector: sel!(setUsesSingleLineMode:)] {
+                        let _: () = msg_send![text, setUsesSingleLineMode: true];
+                    }
+                    let trunc_middle: u64 = 5; // NSLineBreakByTruncatingMiddle
+                    if msg_send![text, respondsToSelector: sel!(setLineBreakMode:)] {
+                        let _: () = msg_send![text, setLineBreakMode: trunc_middle];
+                    }
+                    // 左对齐文本
+                    let align_left: i64 = 0; // NSTextAlignmentLeft
+                    if msg_send![text, respondsToSelector: sel!(setAlignment:)] {
+                        let _: () = msg_send![text, setAlignment: align_left];
+                    }
+                    if msg_send![text, respondsToSelector: sel!(setSelectable:)] {
+                        let _: () = msg_send![text, setSelectable: false];
+                    }
+                    let _: () = msg_send![text, setTag: 1002isize];
+                    let _: () = msg_send![cell, addSubview: text];
+                }
+
+                // 更新布局
+                let h: f64 = msg_send![table, rowHeight];
+                let table_frame: NSRect = msg_send![table, frame];
+                let pad_y = ((h - 18.0).max(0.0)) / 2.0;
+                let left_pad = 8.0f64;
+                let right_pad = 8.0f64;
+                let text_x = left_pad;
+                // 文本占满整行（右侧仅留 padding）
+                let text_w = (table_frame.size.width - left_pad - right_pad).max(30.0);
+
+                let text: *mut AnyObject = msg_send![cell, viewWithTag: 1002isize];
+                if !text.is_null() {
+                    let _: () = msg_send![text, setFrame: NSRect { origin: NSPoint { x: text_x, y: pad_y }, size: NSSize { width: text_w, height: 18.0 } }];
+                    let ns = NSString::from_str(&text_str);
+                    let _: () = msg_send![text, setStringValue: &*ns];
+                }
+
+                println!("[配置] 布局 row={} text_w={:.1}", row, text_w);
+
+                cell
+            }
+        }
+
+        extern "C" fn on_row_delete(_this: &AnyObject, _sel: Sel, sender: *mut AnyObject) {
+            unsafe {
+                let table = CONFIG_TABLE_PTR.load(Ordering::Relaxed);
+                if table.is_null() { return; }
+                // 通过 NSTableView 计算该视图所在行
+                let row: isize = msg_send![table, rowForView: sender];
+                println!("[配置] 删除 row={}", row);
+                if row < 0 { return; }
+                let mut lines: Vec<String> = get_saved_paths_string()
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let idx = row as usize;
+                if idx >= lines.len() { return; }
+                lines.remove(idx);
+                set_saved_paths_string(&lines.join("\n"));
+                update_config_table();
+                rebuild_all_context_menus();
+            }
+        }
+
+        // 底部“－”按钮：按选中行移除
+        extern "C" fn on_config_remove_selected(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+            unsafe {
+                let table = CONFIG_TABLE_PTR.load(Ordering::Relaxed);
+                if table.is_null() { return; }
+                let row: isize = msg_send![table, selectedRow];
+                if row < 0 { return; }
+                let mut lines: Vec<String> = get_saved_paths_string()
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let idx = row as usize;
+                if idx >= lines.len() { return; }
+                lines.remove(idx);
+                set_saved_paths_string(&lines.join("\n"));
+                update_config_table();
+                rebuild_all_context_menus();
+            }
+        }
+
+        // 拖拽排序：整行可拖拽
+        extern "C" fn table_view_write_rows(
+            _this: &AnyObject,
+            _sel: Sel,
+            _table: *mut AnyObject,
+            index_set: *mut AnyObject,
+            pb: *mut AnyObject,
+        ) -> Bool {
+            unsafe {
+                let first: u64 = msg_send![index_set, firstIndex];
+                let row = first as isize;
+                println!("[配置] writeRows: row={}", row);
+                // 为拖拽声明粘贴板类型并写入占位数据（本地拖拽也需要）
+                if !pb.is_null() {
+                    let drag_type = NSString::from_str("com.alacritty.pathrow");
+                    let types: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: &*drag_type];
+                    let _: isize = msg_send![pb, declareTypes: types, owner: std::ptr::null::<AnyObject>()];
+                    let payload = NSString::from_str("row");
+                    let _: Bool = msg_send![pb, setString: &*payload, forType: &*drag_type];
+                }
+                DRAG_SOURCE_INDEX.store(row, Ordering::Relaxed);
+            }
+            Bool::YES
+        }
+
+        extern "C" fn table_view_validate_drop(
+            _this: &AnyObject,
+            _sel: Sel,
+            table: *mut AnyObject,
+            _info: *mut AnyObject,
+            row: isize,
+            _op: isize,
+        ) -> u64 {
+            unsafe {
+                let drop_above: i64 = 1; // NSTableViewDropAbove
+                let _: () = msg_send![table, setDropRow: row, dropOperation: drop_above];
+            }
+            println!("[配置] validateDrop: row={}", row);
+            16 // NSDragOperationMove
+        }
+
+        extern "C" fn table_view_accept_drop(
+            _this: &AnyObject,
+            _sel: Sel,
+            _table: *mut AnyObject,
+            _info: *mut AnyObject,
+            row: isize,
+            _op: isize,
+        ) -> Bool {
+            unsafe {
+                let from = DRAG_SOURCE_INDEX.swap(-1, Ordering::Relaxed);
+                if from < 0 { return Bool::NO; }
+                println!("[配置] acceptDrop: from={} to_row={}", from, row);
+                let mut lines: Vec<String> = get_saved_paths_string()
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if lines.is_empty() { return Bool::NO; }
+                let len = lines.len();
+                let mut to = row.max(0) as usize;
+                if to > len { to = len; }
+                let from_us = from as usize;
+                if from_us >= len { return Bool::NO; }
+                let item = lines.remove(from_us);
+                if from_us < to { to = to.saturating_sub(1); }
+                if to > lines.len() { to = lines.len(); }
+                lines.insert(to, item);
+                set_saved_paths_string(&lines.join("\n"));
+                update_config_table();
+                rebuild_all_context_menus();
+            }
+            Bool::YES
+        }
+
         unsafe {
             builder.add_method(sel!(onStatusItemClick:), on_click as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemNewWindow:), on_new_window as extern "C" fn(_, _, _));
@@ -205,6 +416,51 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             builder.add_method(sel!(onConfigAddPath:), on_config_add_path as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemOpenSavedPath:), on_open_saved_path as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemQuit:), on_quit as extern "C" fn(_, _, _));
+
+            // 表格数据源/委托
+            builder.add_method(sel!(numberOfRowsInTableView:), number_of_rows_in_table as extern "C" fn(_, _, _) -> isize);
+            builder.add_method(sel!(tableView:viewForTableColumn:row:), table_view_view_for_col_row as extern "C" fn(_, _, _, _, isize) -> *mut AnyObject);
+            // 拖拽 & 行按钮
+            builder.add_method(sel!(tableView:writeRowsWithIndexes:toPasteboard:), table_view_write_rows as extern "C" fn(_, _, _, _, _) -> Bool);
+            builder.add_method(sel!(tableView:validateDrop:proposedRow:proposedDropOperation:), table_view_validate_drop as extern "C" fn(_, _, _, _, isize, isize) -> u64);
+            builder.add_method(sel!(tableView:acceptDrop:row:dropOperation:), table_view_accept_drop as extern "C" fn(_, _, _, _, isize, isize) -> Bool);
+            builder.add_method(sel!(onRowDelete:), on_row_delete as extern "C" fn(_, _, _));
+            builder.add_method(sel!(onConfigRemoveSelected:), on_config_remove_selected as extern "C" fn(_, _, _));
+        }
+
+        let cls = builder.register();
+        CLS = Some(cls);
+    });
+
+    unsafe { CLS.unwrap() }
+}
+
+// 自定义 NSTableView 子类：统一在表格区域显示“小手”光标
+fn ensure_path_tableview_class() -> &'static AnyClass {
+    use objc2::declare::ClassBuilder;
+    use std::ffi::CString;
+
+    static mut CLS: Option<&'static AnyClass> = None;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let name = CString::new("AlacrittyPathTableView").unwrap();
+        let mut builder = ClassBuilder::new(name.as_c_str(), class!(NSTableView))
+            .expect("create table view subclass");
+
+        extern "C" fn reset_cursor_rects(this: &AnyObject, _sel: Sel) {
+            unsafe {
+                // 在整行（保留少量右侧 padding）范围内使用 openHand 光标
+                let bounds: NSRect = msg_send![this, bounds];
+                let right_pad: f64 = 4.0;
+                let width = (bounds.size.width - right_pad).max(1.0);
+                let rect = NSRect { origin: bounds.origin, size: NSSize { width, height: bounds.size.height } };
+                let cursor: *mut AnyObject = msg_send![class!(NSCursor), openHandCursor];
+                let _: () = msg_send![this, addCursorRect: rect, cursor: cursor];
+            }
+        }
+
+        unsafe {
+            builder.add_method(sel!(resetCursorRects), reset_cursor_rects as extern "C" fn(_, _));
         }
 
         let cls = builder.register();
@@ -589,19 +845,15 @@ fn set_saved_paths_string(s: &str) {
 
 // 路径展示遵循全局工具：crate::path_util::shorten_home
 
-fn update_config_textview() {
+fn update_config_table() {
     unsafe {
-        let tv = CONFIG_TEXTVIEW_PTR.load(Ordering::Relaxed);
-        if tv.is_null() { return; }
-        let content = get_saved_paths_string();
-        // 展示时将 HOME 前缀替换为 `~`
-        let display = content
-            .lines()
-            .map(|s| crate::path_util::shorten_home(s.trim()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let ns = NSString::from_str(&display);
-        let _: () = msg_send![tv, setString: &*ns];
+        let table = CONFIG_TABLE_PTR.load(Ordering::Relaxed);
+        if table.is_null() { return; }
+        let _: () = msg_send![table, reloadData];
+        // 触发重置光标区域
+        if msg_send![table, respondsToSelector: sel!(resetCursorRects)] {
+            let _: () = msg_send![table, resetCursorRects];
+        }
     }
 }
 
@@ -654,7 +906,7 @@ pub unsafe fn pick_and_append_folder_path() {
     }
     let new_content = lines.join("\n");
     set_saved_paths_string(&new_content);
-    update_config_textview();
+    update_config_table();
     // 列表改变后，重建所有右键菜单
     rebuild_all_context_menus();
 }
@@ -666,7 +918,7 @@ pub unsafe fn open_config_window() {
     if !existing.is_null() {
         let _: () = msg_send![existing, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![existing, center];
-        update_config_textview();
+        update_config_table();
         return;
     }
 
@@ -701,47 +953,102 @@ pub unsafe fn open_config_window() {
     let cv_frame: NSRect = msg_send![content_view, frame];
     let pad: f64 = 16.0;
     let btn_h: f64 = 28.0;
-    let btn_w: f64 = 80.0;
+    let btn_w: f64 = 28.0; // 使用方形小按钮呈现“＋/－”
 
-    // 计算布局
+    // 计算布局：按钮在底部左侧（Finder 风格）
     let btn_x = 16.0f64;
-    let btn_y = cv_frame.size.height - pad - btn_h;
-    let btn_frame = NSRect { origin: NSPoint { x: btn_x, y: btn_y }, size: NSSize { width: btn_w, height: btn_h } };
+    let btn_y = pad;
+    let btn_frame_plus = NSRect { origin: NSPoint { x: btn_x, y: btn_y }, size: NSSize { width: btn_w, height: btn_h } };
+    let btn_gap = 8.0f64;
+    let btn_frame_minus = NSRect { origin: NSPoint { x: btn_x + btn_w + btn_gap, y: btn_y }, size: NSSize { width: btn_w, height: btn_h } };
 
     let scroll_x = pad;
-    let scroll_y = pad;
+    // 底部预留按钮区
+    let scroll_y = pad + btn_h + pad;
     let scroll_w = cv_frame.size.width - 2.0 * pad;
     let scroll_h = cv_frame.size.height - (3.0 * pad) - btn_h;
     let scroll_frame = NSRect { origin: NSPoint { x: scroll_x, y: scroll_y }, size: NSSize { width: scroll_w, height: scroll_h } };
 
-    // 按钮：添加
-    let btn_title = NSString::from_str("添加");
-    let button: *mut AnyObject = msg_send![class!(NSButton), alloc];
-    let button: *mut AnyObject = msg_send![button, initWithFrame: btn_frame];
-    let _: () = msg_send![button, setTitle: &*btn_title];
-    // 绑定 target/action
+    // 按钮：＋ / －
     let cls = ensure_click_handler_class();
     let handler: Retained<AnyObject> = msg_send![cls, new];
-    let _: () = msg_send![button, setTarget: &*handler];
-    let _: () = msg_send![button, setAction: sel!(onConfigAddPath:)];
 
-    // 滚动 + 文本视图显示路径列表
+    // ＋ 按钮（添加）
+    let btn_title_plus = NSString::from_str("＋");
+    let button_plus: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let button_plus: *mut AnyObject = msg_send![button_plus, initWithFrame: btn_frame_plus];
+    let _: () = msg_send![button_plus, setTitle: &*btn_title_plus];
+    let _: () = msg_send![button_plus, setTarget: &*handler];
+    let _: () = msg_send![button_plus, setAction: sel!(onConfigAddPath:)];
+
+    // － 按钮（移除选中）
+    let btn_title_minus = NSString::from_str("－");
+    let button_minus: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let button_minus: *mut AnyObject = msg_send![button_minus, initWithFrame: btn_frame_minus];
+    let _: () = msg_send![button_minus, setTitle: &*btn_title_minus];
+    let _: () = msg_send![button_minus, setTarget: &*handler];
+    let _: () = msg_send![button_minus, setAction: sel!(onConfigRemoveSelected:)];
+
+    // 滚动 + 表格视图显示路径列表
     let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
     let scroll: *mut AnyObject = msg_send![scroll, initWithFrame: scroll_frame];
-    let text: *mut AnyObject = msg_send![class!(NSTextView), alloc];
-    let text: *mut AnyObject = msg_send![text, initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: scroll_w, height: scroll_h } }];
-    let _: () = msg_send![text, setEditable: false];
+    let table_cls = ensure_path_tableview_class();
+    let table: *mut AnyObject = msg_send![table_cls, alloc];
+    let table: *mut AnyObject = msg_send![table, initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: scroll_w, height: scroll_h } }];
+    let col: *mut AnyObject = msg_send![class!(NSTableColumn), alloc];
+    let identifier = NSString::from_str("PathColumn");
+    let col: *mut AnyObject = msg_send![col, initWithIdentifier: &*identifier];
+    let _: () = msg_send![col, setWidth: scroll_w];
+    let _: () = msg_send![table, addTableColumn: col];
+    // 隐藏表头
+    let _: () = msg_send![table, setHeaderView: std::ptr::null::<AnyObject>()];
+    // 行背景：交替颜色显示
+    let _: () = msg_send![table, setUsesAlternatingRowBackgroundColors: true];
+    if msg_send![table, respondsToSelector: sel!(setGridStyleMask:)] {
+        let _: () = msg_send![table, setGridStyleMask: 0u64];
+    }
+    if msg_send![table, respondsToSelector: sel!(setBackgroundColor:)] {
+        let bg: *mut AnyObject = msg_send![class!(NSColor), controlBackgroundColor];
+        let _: () = msg_send![table, setBackgroundColor: bg];
+    }
+    let _: () = msg_send![table, setRowHeight: 22.0f64];
+    let spacing = NSSize { width: 0.0, height: 2.0 };
+    let _: () = msg_send![table, setIntercellSpacing: spacing];
+    // 单选即可（便于移动顺序）
+    let _: () = msg_send![table, setAllowsMultipleSelection: false];
+    // dataSource / delegate 使用 handler
+    let _: () = msg_send![table, setDataSource: &*handler];
+    let _: () = msg_send![table, setDelegate: &*handler];
+    // 注册拖拽类型并限定为本地移动
+    let drag_type = NSString::from_str("com.alacritty.pathrow");
+    let types: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: &*drag_type];
+    let _: () = msg_send![table, registerForDraggedTypes: types];
+    let op_move: u64 = 16; // NSDragOperationMove
+    let _: () = msg_send![table, setDraggingSourceOperationMask: op_move, forLocal: true];
+    let _: () = msg_send![table, setDraggingSourceOperationMask: op_move, forLocal: false];
+    // 嵌入滚动视图
     let _: () = msg_send![scroll, setHasVerticalScroller: true];
-    let _: () = msg_send![scroll, setDocumentView: text];
+    if msg_send![scroll, respondsToSelector: sel!(setDrawsBackground:)] {
+        let _: () = msg_send![scroll, setDrawsBackground: true];
+    }
+    if msg_send![scroll, respondsToSelector: sel!(setBorderType:)] {
+        let _: () = msg_send![scroll, setBorderType: 0u64];
+    }
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    if !clip.is_null() && msg_send![clip, respondsToSelector: sel!(setDrawsBackground:)] {
+        let _: () = msg_send![clip, setDrawsBackground: true];
+    }
+    let _: () = msg_send![scroll, setDocumentView: table];
 
     // 添加子视图
     let _: () = msg_send![content_view, addSubview: scroll];
-    let _: () = msg_send![content_view, addSubview: button];
+    let _: () = msg_send![content_view, addSubview: button_plus];
+    let _: () = msg_send![content_view, addSubview: button_minus];
 
     // 保存全局指针并设置初始内容
     CONFIG_WINDOW_PTR.store(win, Ordering::Relaxed);
-    CONFIG_TEXTVIEW_PTR.store(text, Ordering::Relaxed);
-    update_config_textview();
+    CONFIG_TABLE_PTR.store(table, Ordering::Relaxed);
+    update_config_table();
 
     // 显示窗口
     let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
