@@ -6,6 +6,7 @@ use objc2_app_kit::{NSApplication, NSStatusBar, NSStatusItem, NSMenu, NSMenuItem
 use crate::macos::hotkey;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, AtomicIsize, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::cell::RefCell;
 use std::sync::OnceLock;
 use winit::event_loop::EventLoopProxy;
@@ -13,6 +14,10 @@ use winit::event_loop::EventLoopProxy;
 use crate::cli::WindowOptions;
 use crate::event::{Event, EventType};
 use std::path::PathBuf;
+use std::path::Path;
+use std::fs;
+
+use toml_edit::{DocumentMut, Item, Array as TomlArray};
 
 // 全局保存指针（原生指针是线程安全可共享的）。
 // 兼容旧实现的全局指针（不再作为逻辑依据，仅做向后兼容）。
@@ -23,7 +28,12 @@ static EVENT_PROXY: OnceLock<EventLoopProxy<Event>> = OnceLock::new();
 // 配置窗口与内容视图控件指针
 static CONFIG_WINDOW_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 static CONFIG_TABLE_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
+// 主题窗口与表格
+static THEME_WINDOW_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
+static THEME_TABLE_PTR: AtomicPtr<AnyObject> = AtomicPtr::new(std::ptr::null_mut());
 static DRAG_SOURCE_INDEX: AtomicIsize = AtomicIsize::new(-1);
+// 防抖：避免在 reloadData 引起的二次通知中重复应用主题
+static APPLYING_THEME: AtomicBool = AtomicBool::new(false);
 // 记录所有已创建的 NSWindow 指针，用于统一显示/隐藏。
 // 记录我们创建的标题栏视图，避免重复创建（可为空）。
 //
@@ -165,6 +175,109 @@ unsafe fn set_status_item_icon(item: &NSStatusItem) -> bool {
 }
 
 
+// ========== 主题处理：路径/读取/写入 工具 ==========
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+fn expand_tilde<S: AsRef<str>>(p: S) -> String {
+    let p = p.as_ref();
+    if let Some(home) = home_dir() {
+        if let Some(rest) = p.strip_prefix("~") {
+            return format!("{}{}", home.display(), rest);
+        }
+    }
+    p.to_string()
+}
+
+fn alacritty_config_path() -> Option<PathBuf> {
+    // 按需求固定使用 ~/.config/alacritty/alacritty.toml
+    let home = home_dir()?;
+    Some(home.join(".config").join("alacritty").join("alacritty.toml"))
+}
+
+fn theme_dir_path() -> Option<PathBuf> {
+    let home = home_dir()?;
+    Some(home.join(".config").join("alacritty").join("themes").join("themes"))
+}
+
+fn list_theme_files() -> Vec<PathBuf> {
+    let dir = match theme_dir_path() { Some(p) => p, None => return vec![] };
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                    if ext.eq_ignore_ascii_case("toml") { out.push(p); }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn theme_path_to_tilde(path: &Path) -> String {
+    // 生成以 ~ 开头的主题路径，固定放在 ~/.config/alacritty/themes/themes 下
+    let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    format!("~/.config/alacritty/themes/themes/{}", file)
+}
+
+fn read_current_theme_expanded() -> Option<String> {
+    let cfg = alacritty_config_path()?;
+    let data = fs::read_to_string(cfg).ok()?;
+    if let Ok(mut doc) = data.parse::<DocumentMut>() {
+        let general = &doc["general"];
+        if let Item::Table(tbl) = general {
+            if let Some(import_item) = tbl.get("import") {
+                // 仅取第一个字符串项
+                if import_item.is_array() {
+                    let arr = import_item.as_array().unwrap();
+                    for it in arr.iter() {
+                        if let Some(s) = it.as_str() {
+                            let expanded = expand_tilde(s);
+                            return Some(expanded);
+                        }
+                    }
+                } else if let Some(s) = import_item.as_value().and_then(|v| v.as_str()) {
+                    let expanded = expand_tilde(s);
+                    return Some(expanded);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn write_theme_to_config(theme_tilde_path: &str) -> Result<(), String> {
+    let cfg = alacritty_config_path().ok_or_else(|| "无法定位配置文件路径".to_string())?;
+    let mut doc = if let Ok(s) = fs::read_to_string(&cfg) {
+        s.parse::<DocumentMut>().map_err(|e| format!("解析配置失败: {e}"))?
+    } else {
+        DocumentMut::new()
+    };
+
+    // 确保 [general]
+    if doc.get("general").is_none() {
+        doc["general"] = Item::Table(Default::default());
+    }
+    // 设置 import = [ "..." ]
+    let mut arr = TomlArray::default();
+    arr.push(theme_tilde_path);
+    doc["general"]["import"] = Item::Value(arr.into());
+
+    // 创建父目录
+    if let Some(parent) = cfg.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
+        }
+    }
+    fs::write(&cfg, doc.to_string()).map_err(|e| format!("写入配置失败: {e}"))
+}
+
+// 主题子菜单已移除，改为独立窗口
+
 // 动态注册一个 Objective-C 类，作为 target/action 的处理对象。
 fn ensure_click_handler_class() -> &'static AnyClass {
     use objc2::declare::ClassBuilder;
@@ -214,6 +327,11 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             if let Some(proxy) = EVENT_PROXY.get() {
                 let _ = proxy.send_event(Event::new(EventType::ToggleAllWindows, None));
             }
+        }
+
+        // 打开主题窗口
+        extern "C" fn on_open_themes(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+            unsafe { super::status_bar::open_theme_window(); }
         }
 
         extern "C" fn on_new_window(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
@@ -302,6 +420,52 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             }
         }
 
+        // 主题列表窗口：点击行切换主题
+        extern "C" fn on_theme_row_click(_this: &AnyObject, _sel: Sel, sender: *mut AnyObject) {
+            unsafe {
+                if sender.is_null() { return; }
+                // 优先使用 clickedRow（鼠标点击行），否则回退到 selectedRow
+                let mut row: isize = msg_send![sender, clickedRow];
+                if row < 0 { row = msg_send![sender, selectedRow]; }
+                if row < 0 { return; }
+                let idx = row as usize;
+                let themes = list_theme_files();
+                if idx >= themes.len() { return; }
+                if APPLYING_THEME.swap(true, Ordering::SeqCst) { return; }
+                let tilde = theme_path_to_tilde(&themes[idx]);
+                if let Err(e) = super::status_bar::write_theme_to_config(&tilde) {
+                    eprintln!("写入主题到配置失败: {}", e);
+                }
+                update_theme_table();
+                rebuild_all_context_menus();
+                APPLYING_THEME.store(false, Ordering::SeqCst);
+            }
+        }
+
+        // 主题列表窗口：监听选中变化（无论点击还是键盘），立即应用主题
+        extern "C" fn on_theme_selection_changed(_this: &AnyObject, _sel: Sel, notif: *mut AnyObject) {
+            unsafe {
+                if notif.is_null() { return; }
+                // 仅处理来自主题表的通知
+                let obj: *mut AnyObject = msg_send![notif, object];
+                let theme_table = THEME_TABLE_PTR.load(Ordering::Relaxed);
+                if obj.is_null() || theme_table.is_null() || obj != theme_table { return; }
+                let row: isize = msg_send![theme_table, selectedRow];
+                if row < 0 { return; }
+                let idx = row as usize;
+                let themes = list_theme_files();
+                if idx >= themes.len() { return; }
+                if APPLYING_THEME.swap(true, Ordering::SeqCst) { return; }
+                let tilde = theme_path_to_tilde(&themes[idx]);
+                if let Err(e) = super::status_bar::write_theme_to_config(&tilde) {
+                    eprintln!("写入主题到配置失败: {}", e);
+                }
+                update_theme_table();
+                rebuild_all_context_menus();
+                APPLYING_THEME.store(false, Ordering::SeqCst);
+            }
+        }
+
         extern "C" fn on_open_saved_path(_this: &AnyObject, _sel: Sel, sender: *mut AnyObject) {
             // 从菜单项的 representedObject 取出路径字符串，在该目录新建窗口
             unsafe {
@@ -356,14 +520,19 @@ fn ensure_click_handler_class() -> &'static AnyClass {
         }
 
         // NSTableView 数据源/委托 + 配置按钮行为
-        extern "C" fn number_of_rows_in_table(_this: &AnyObject, _sel: Sel, _table: *mut AnyObject) -> isize {
+        extern "C" fn number_of_rows_in_table(_this: &AnyObject, _sel: Sel, table: *mut AnyObject) -> isize {
+            let theme_table = THEME_TABLE_PTR.load(Ordering::Relaxed);
+            if !theme_table.is_null() && theme_table == table {
+                let count = list_theme_files().len();
+                return count as isize;
+            }
+            // 默认：配置窗口的路径列表
             let content = get_saved_paths_string();
             let count = content
                 .lines()
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .count();
-            // removed noisy debug print
             count as isize
         }
 
@@ -375,31 +544,43 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             row: isize,
         ) -> *mut AnyObject {
             unsafe {
-                // 取数据
-                let lines: Vec<String> = get_saved_paths_string()
-                    .lines()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let idx = if row < 0 { 0 } else { row as usize };
-                let text_str = if idx < lines.len() {
-                    let raw = lines[idx].trim();
-                    if raw == "---" {
-                        "── 分隔线 ──".to_string()
-                    } else if let Some(rest) = raw.strip_prefix("text:") {
-                        rest.trim().to_string()
-                    } else {
-                        crate::path_util::shorten_home(raw)
-                    }
+                // Theme 表：按需生成
+                let theme_table = THEME_TABLE_PTR.load(Ordering::Relaxed);
+                let is_theme = !theme_table.is_null() && theme_table == table;
+
+                let text_str = if is_theme {
+                    let themes = list_theme_files();
+                    let idx = if row < 0 { 0 } else { row as usize };
+                    if idx < themes.len() {
+                        themes[idx].file_stem().and_then(|s| s.to_str()).unwrap_or("主题").to_string()
+                    } else { String::new() }
                 } else {
-                    String::new()
+                    // 配置表：路径文本
+                    let lines: Vec<String> = get_saved_paths_string()
+                        .lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let idx = if row < 0 { 0 } else { row as usize };
+                    if idx < lines.len() {
+                        let raw = lines[idx].trim();
+                        if raw == "---" {
+                            "── 分隔线 ──".to_string()
+                        } else if let Some(rest) = raw.strip_prefix("text:") {
+                            rest.trim().to_string()
+                        } else {
+                            crate::path_util::shorten_home(raw)
+                        }
+                    } else {
+                        String::new()
+                    }
                 };
 
-                // 复用/创建容器单元视图：仅左侧文本（删除改为底部统一按钮）
-                let ident = NSString::from_str("PathCell");
+                // 复用/创建容器单元视图：仅左侧文本
+                let ident = if is_theme { NSString::from_str("ThemeCell") } else { NSString::from_str("PathCell") };
                 let mut cell: *mut AnyObject = msg_send![table, makeViewWithIdentifier: &*ident, owner: table];
                 if cell.is_null() {
-                    let cell_cls = ensure_path_cellview_class();
+                    let cell_cls = if is_theme { ensure_theme_cellview_class() } else { ensure_path_cellview_class() };
                     cell = msg_send![cell_cls, alloc];
                     cell = msg_send![cell, initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 10.0, height: 10.0 } }];
                     let _: () = msg_send![cell, setIdentifier: &*ident];
@@ -413,20 +594,18 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                     let _: () = msg_send![text, setBordered: false];
                     let _: () = msg_send![text, setEditable: false];
                     let _: () = msg_send![text, setBezeled: false];
-                    // 仅随宽度伸缩；垂直居中由 CellView.layout 统一处理
-                    if msg_send![text, respondsToSelector: sel!(setAutoresizingMask:)] {
-                        let mask: u64 = (1u64 << 1); // NSViewWidthSizable
-                        let _: () = msg_send![text, setAutoresizingMask: mask];
-                    }
                     if msg_send![text, respondsToSelector: sel!(setDrawsBackground:)] {
                         let _: () = msg_send![text, setDrawsBackground: false];
                     }
                     if msg_send![text, respondsToSelector: sel!(setUsesSingleLineMode:)] {
                         let _: () = msg_send![text, setUsesSingleLineMode: true];
                     }
-                    let trunc_middle: u64 = 5; // NSLineBreakByTruncatingMiddle
-                    if msg_send![text, respondsToSelector: sel!(setLineBreakMode:)] {
-                        let _: () = msg_send![text, setLineBreakMode: trunc_middle];
+                    if !is_theme {
+                        // 配置表采用中间省略，主题表由自定义布局控制
+                        let trunc_middle: u64 = 5; // NSLineBreakByTruncatingMiddle
+                        if msg_send![text, respondsToSelector: sel!(setLineBreakMode:)] {
+                            let _: () = msg_send![text, setLineBreakMode: trunc_middle];
+                        }
                     }
                     // 左对齐文本
                     let align_left: i64 = 0; // NSTextAlignmentLeft
@@ -436,15 +615,47 @@ fn ensure_click_handler_class() -> &'static AnyClass {
                     if msg_send![text, respondsToSelector: sel!(setSelectable:)] {
                         let _: () = msg_send![text, setSelectable: false];
                     }
-                    let _: () = msg_send![text, setTag: 1002isize];
+                    let tag = if is_theme { 2101isize } else { 1002isize };
+                    let _: () = msg_send![text, setTag: tag];
                     let _: () = msg_send![cell, addSubview: text];
+
+                    if is_theme {
+                        // 右侧勾标记（默认隐藏，选中主题时显示）
+                        let check: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+                        let check: *mut AnyObject = msg_send![check, initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 16.0, height: 18.0 } }];
+                        let tick = NSString::from_str("✓");
+                        let _: () = msg_send![check, setStringValue: &*tick];
+                        let _: () = msg_send![check, setBordered: false];
+                        let _: () = msg_send![check, setEditable: false];
+                        let _: () = msg_send![check, setBezeled: false];
+                        if msg_send![check, respondsToSelector: sel!(setDrawsBackground:)] { let _: () = msg_send![check, setDrawsBackground: false]; }
+                        let align_center: i64 = 2; // NSTextAlignmentCenter
+                        if msg_send![check, respondsToSelector: sel!(setAlignment:)] { let _: () = msg_send![check, setAlignment: align_center]; }
+                        if msg_send![check, respondsToSelector: sel!(setSelectable:)] { let _: () = msg_send![check, setSelectable: false]; }
+                        let _: () = msg_send![check, setHidden: true];
+                        let _: () = msg_send![check, setTag: 2102isize];
+                        let _: () = msg_send![cell, addSubview: check];
+                    }
                 }
 
                 // 更新内容，布局交由自定义 CellView 处理
-                let text: *mut AnyObject = msg_send![cell, viewWithTag: 1002isize];
+                let text_tag = if is_theme { 2101isize } else { 1002isize };
+                let text: *mut AnyObject = msg_send![cell, viewWithTag: text_tag];
                 if !text.is_null() {
                     let ns = NSString::from_str(&text_str);
                     let _: () = msg_send![text, setStringValue: &*ns];
+                }
+                if is_theme {
+                    let check: *mut AnyObject = msg_send![cell, viewWithTag: 2102isize];
+                    if !check.is_null() {
+                        let themes = list_theme_files();
+                        let idx = if row < 0 { 0 } else { row as usize };
+                        let is_current = if idx < themes.len() {
+                            let tilde = theme_path_to_tilde(&themes[idx]);
+                            read_current_theme_expanded().map(|c| c == expand_tilde(&tilde)).unwrap_or(false)
+                        } else { false };
+                        let _: () = msg_send![check, setHidden: !is_current];
+                    }
                 }
                 if msg_send![cell, respondsToSelector: sel!(setNeedsLayout:)] {
                     let _: () = msg_send![cell, setNeedsLayout: true];
@@ -527,10 +738,13 @@ fn ensure_click_handler_class() -> &'static AnyClass {
         extern "C" fn table_view_write_rows(
             _this: &AnyObject,
             _sel: Sel,
-            _table: *mut AnyObject,
+            table: *mut AnyObject,
             index_set: *mut AnyObject,
             pb: *mut AnyObject,
         ) -> Bool {
+            // 仅对配置表支持拖拽；主题表返回 NO
+            let theme_table = THEME_TABLE_PTR.load(Ordering::Relaxed);
+            if !theme_table.is_null() && theme_table == table { return Bool::NO; }
             unsafe {
                 let first: u64 = msg_send![index_set, firstIndex];
                 let row = first as isize;
@@ -556,6 +770,9 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             row: isize,
             _op: isize,
         ) -> u64 {
+            // 仅对配置表支持拖拽；主题表返回 0
+            let theme_table = THEME_TABLE_PTR.load(Ordering::Relaxed);
+            if !theme_table.is_null() && theme_table == table { return 0; }
             unsafe {
                 let drop_above: i64 = 1; // NSTableViewDropAbove
                 let _: () = msg_send![table, setDropRow: row, dropOperation: drop_above];
@@ -567,11 +784,14 @@ fn ensure_click_handler_class() -> &'static AnyClass {
         extern "C" fn table_view_accept_drop(
             _this: &AnyObject,
             _sel: Sel,
-            _table: *mut AnyObject,
+            table: *mut AnyObject,
             _info: *mut AnyObject,
             row: isize,
             _op: isize,
         ) -> Bool {
+            // 仅对配置表支持拖拽；主题表返回 NO
+            let theme_table = THEME_TABLE_PTR.load(Ordering::Relaxed);
+            if !theme_table.is_null() && theme_table == table { return Bool::NO; }
             unsafe {
                 let from = DRAG_SOURCE_INDEX.swap(-1, Ordering::Relaxed);
                 if from < 0 { return Bool::NO; }
@@ -606,6 +826,8 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             builder.add_method(sel!(onStatusItemOpenSavedPath:), on_open_saved_path as extern "C" fn(_, _, _));
             builder.add_method(sel!(onStatusItemQuit:), on_quit as extern "C" fn(_, _, _));
             builder.add_method(sel!(onConfigHotkeyRecorded:), on_config_hotkey_recorded as extern "C" fn(_, _, _));
+            // 主题窗口
+            builder.add_method(sel!(onStatusItemOpenThemes:), on_open_themes as extern "C" fn(_, _, _));
 
             // 表格数据源/委托
             builder.add_method(sel!(numberOfRowsInTableView:), number_of_rows_in_table as extern "C" fn(_, _, _) -> isize);
@@ -618,6 +840,8 @@ fn ensure_click_handler_class() -> &'static AnyClass {
             builder.add_method(sel!(onConfigRemoveSelected:), on_config_remove_selected as extern "C" fn(_, _, _));
             builder.add_method(sel!(onConfigAddSeparator:), on_config_add_separator as extern "C" fn(_, _, _));
             builder.add_method(sel!(onConfigAddText:), on_config_add_text as extern "C" fn(_, _, _));
+            builder.add_method(sel!(onThemeRowClick:), on_theme_row_click as extern "C" fn(_, _, _));
+            builder.add_method(sel!(onThemeSelectionChanged:), on_theme_selection_changed as extern "C" fn(_, _, _));
         }
 
         let cls = builder.register();
@@ -766,6 +990,134 @@ fn ensure_hotkey_recorder_class() -> &'static AnyClass {
     unsafe { CLS.unwrap() }
 }
 
+
+// 自定义 Theme 专用 NSTableView：在键盘上下移动时触发 action
+fn ensure_theme_tableview_class() -> &'static AnyClass {
+    use objc2::declare::ClassBuilder;
+    use std::ffi::CString;
+
+    static mut CLS: Option<&'static AnyClass> = None;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let name = CString::new("AlacrittyThemeTableView").unwrap();
+        let mut builder = ClassBuilder::new(name.as_c_str(), class!(NSTableView))
+            .expect("create theme table view subclass");
+
+        extern "C" fn key_down(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
+            unsafe {
+                // 先让表格处理按键（更新选中行）
+                let _: () = msg_send![super(this, class!(NSTableView)), keyDown: event];
+                // 仅在上下方向键时触发 action，移动时也应用主题
+                if !event.is_null() {
+                    let key_code_u: u16 = msg_send![event, keyCode];
+                    if key_code_u == 125 || key_code_u == 126 { // down/up arrows
+                        let target: *mut AnyObject = msg_send![this, target];
+                        let action: Sel = msg_send![this, action];
+                        if !target.is_null() {
+                            let _: Bool = msg_send![this, sendAction: action, to: target];
+                        }
+                    }
+                }
+            }
+        }
+
+        // 点击后确保表格成为第一响应者，方向键可用
+        extern "C" fn mouse_down(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
+            unsafe {
+                let _: () = msg_send![super(this, class!(NSTableView)), mouseDown: event];
+                let win: *mut AnyObject = msg_send![this, window];
+                if !win.is_null() {
+                    let _: Bool = msg_send![win, makeFirstResponder: this];
+                }
+            }
+        }
+
+        extern "C" fn accepts_first_responder(_this: &AnyObject, _sel: Sel) -> Bool { Bool::YES }
+        extern "C" fn become_first_responder(_this: &AnyObject, _sel: Sel) -> Bool { Bool::YES }
+
+        extern "C" fn reset_cursor_rects(this: &AnyObject, _sel: Sel) {
+            unsafe {
+                // 使用默认箭头光标覆盖整个表格区域
+                let bounds: NSRect = msg_send![this, bounds];
+                let cursor: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
+                let _: () = msg_send![this, addCursorRect: bounds, cursor: cursor];
+            }
+        }
+
+        unsafe {
+            builder.add_method(sel!(keyDown:), key_down as extern "C" fn(_, _, _));
+            builder.add_method(sel!(mouseDown:), mouse_down as extern "C" fn(_, _, _));
+            builder.add_method(sel!(acceptsFirstResponder), accepts_first_responder as extern "C" fn(_, _) -> Bool);
+            builder.add_method(sel!(becomeFirstResponder), become_first_responder as extern "C" fn(_, _) -> Bool);
+            builder.add_method(sel!(resetCursorRects), reset_cursor_rects as extern "C" fn(_, _));
+        }
+
+        let cls = builder.register();
+        CLS = Some(cls);
+    });
+
+    unsafe { CLS.unwrap() }
+}
+
+// Theme 列表单元格：左侧文本，右侧“✓”对齐
+fn ensure_theme_cellview_class() -> &'static AnyClass {
+    use objc2::declare::ClassBuilder;
+    use std::ffi::CString;
+
+    static mut CLS: Option<&'static AnyClass> = None;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let name = CString::new("AlacrittyThemeCellView").unwrap();
+        let mut builder = ClassBuilder::new(name.as_c_str(), class!(NSTableCellView))
+            .expect("create theme cell view subclass");
+
+        extern "C" fn layout(this: &AnyObject, _sel: Sel) {
+            unsafe {
+                let bounds: NSRect = msg_send![this, bounds];
+                let h = bounds.size.height;
+                let w = bounds.size.width;
+                let left_pad: f64 = 12.0;
+                let right_pad: f64 = 12.0;
+                let text_h: f64 = 18.0;
+                let check_w: f64 = 16.0;
+                let pad_y = ((h - text_h).max(0.0)) / 2.0;
+                let flipped: Bool = msg_send![this, isFlipped];
+                let is_flipped = flipped == Bool::YES;
+                let text_y = if is_flipped { pad_y } else { h - text_h - pad_y };
+
+                let check: *mut AnyObject = msg_send![this, viewWithTag: 2102isize];
+                let text: *mut AnyObject = msg_send![this, viewWithTag: 2101isize];
+
+                // 右侧勾：靠右对齐
+                if !check.is_null() {
+                    let _: () = msg_send![check, setFrame: NSRect {
+                        origin: NSPoint { x: (w - right_pad - check_w).max(0.0), y: text_y },
+                        size: NSSize { width: check_w, height: text_h },
+                    }];
+                }
+
+                // 左侧文本：占据余下空间
+                if !text.is_null() {
+                    let right_limit = if check.is_null() { w - right_pad } else { (w - right_pad - check_w - 6.0).max(left_pad) };
+                    let text_w = (right_limit - left_pad).max(30.0);
+                    let _: () = msg_send![text, setFrame: NSRect {
+                        origin: NSPoint { x: left_pad, y: text_y },
+                        size: NSSize { width: text_w, height: text_h },
+                    }];
+                }
+            }
+        }
+
+        unsafe {
+            builder.add_method(sel!(layout), layout as extern "C" fn(_, _));
+        }
+
+        let cls = builder.register();
+        CLS = Some(cls);
+    });
+
+    unsafe { CLS.unwrap() }
+}
 
 // 自定义 NSTableCellView：在 layout 阶段将文本视图垂直居中并设置左右内边距
 fn ensure_path_cellview_class() -> &'static AnyClass {
@@ -1051,6 +1403,18 @@ fn build_context_menu_for_target(target: *mut AnyObject) -> *mut AnyObject {
         let _: () = msg_send![mi2, setTarget: target];
         let _: () = msg_send![menu, addItem: mi2];
 
+        // 主题窗口入口（位于“配置”后）
+        let theme_title = NSString::from_str("主题");
+        let mi_theme_alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let mi_theme: *mut AnyObject = msg_send![
+            mi_theme_alloc,
+            initWithTitle: &*theme_title,
+            action: sel!(onStatusItemOpenThemes:),
+            keyEquivalent: &*empty_key
+        ];
+        let _: () = msg_send![mi_theme, setTarget: target];
+        let _: () = msg_send![menu, addItem: mi_theme];
+
         // 分隔线
         let sep2: *mut AnyObject = msg_send![class!(NSMenuItem), separatorItem];
         let _: () = msg_send![menu, addItem: sep2];
@@ -1314,6 +1678,29 @@ fn update_config_table() {
     }
 }
 
+fn update_theme_table() {
+    unsafe {
+        let table = THEME_TABLE_PTR.load(Ordering::Relaxed);
+        if table.is_null() { return; }
+        let _: () = msg_send![table, reloadData];
+        if msg_send![table, respondsToSelector: sel!(sizeLastColumnToFit)] {
+            let _: () = msg_send![table, sizeLastColumnToFit];
+        }
+        // 将选中行与“当前主题”对齐，避免 reload 后高亮停留在旧行
+        if let Some(cur) = read_current_theme_expanded() {
+            let themes = list_theme_files();
+            for (i, p) in themes.iter().enumerate() {
+                if expand_tilde(&theme_path_to_tilde(p)) == cur {
+                    let set: Retained<AnyObject> = msg_send![class!(NSIndexSet), indexSetWithIndex: i as u64];
+                    let _: () = msg_send![table, selectRowIndexes: &*set, byExtendingSelection: false];
+                    let _: () = msg_send![table, scrollRowToVisible: i as isize];
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// 若当前 App 的 keyWindow 就是“配置”窗口，则返回 true。
 /// 用于在“应用从非激活切回激活”的边沿判断是否因点击配置窗口而触发，
 /// 若是，则不应恢复显示所有终端窗口。
@@ -1554,6 +1941,7 @@ pub unsafe fn open_config_window() {
         let mask: u64 = (1u64 << 1) | (1u64 << 4);
         let _: () = msg_send![scroll, setAutoresizingMask: mask];
     }
+    // 配置窗口应使用 PathTableView（显示“小手”光标，便于表达可操作/可拖拽）
     let table_cls = ensure_path_tableview_class();
     let table: *mut AnyObject = msg_send![table_cls, alloc];
     let table: *mut AnyObject = msg_send![table, initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: scroll_w, height: scroll_h } }];
@@ -1688,5 +2076,164 @@ pub unsafe fn open_config_window() {
     let _: () = msg_send![win, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
 
     // 防止 handler 释放
+    std::mem::forget(handler);
+}
+
+/// 打开（或聚焦）主题窗口
+pub unsafe fn open_theme_window() {
+    assert!(MainThreadMarker::new().is_some());
+    let existing = THEME_WINDOW_PTR.load(Ordering::Relaxed);
+    if !existing.is_null() {
+        crate::macos::activation_guard::suppress_next_activation_restore();
+        if msg_send![existing, respondsToSelector: sel!(setCollectionBehavior:)]
+            && msg_send![existing, respondsToSelector: sel!(collectionBehavior)]
+        {
+            let flags: u64 = msg_send![existing, collectionBehavior];
+            let move_to_active_space: u64 = 1u64 << 1; // MoveToActiveSpace
+            let transient: u64 = 1u64 << 3;           // Transient
+            let _: () = msg_send![existing, setCollectionBehavior: flags | move_to_active_space | transient];
+        }
+        let _: () = msg_send![existing, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![existing, center];
+        update_theme_table();
+        return;
+    }
+
+    // 创建窗口
+    let w_alloc: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+    let frame = NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: 420.0, height: 380.0 } };
+    let titled: u64 = 1u64 << 0; // Titled
+    let closable: u64 = 1u64 << 1; // Closable
+    let miniaturizable: u64 = 1u64 << 2; // Miniaturizable
+    let resizable: u64 = 1u64 << 3; // Resizable
+    let style_mask = titled | closable | miniaturizable | resizable;
+    let backing_buffered: u64 = 2; // Buffered
+    let win: *mut AnyObject = msg_send![
+        w_alloc,
+        initWithContentRect: frame,
+        styleMask: style_mask,
+        backing: backing_buffered,
+        defer: false
+    ];
+    if win.is_null() { return; }
+    let title = NSString::from_str("主题");
+    let _: () = msg_send![win, setTitle: &*title];
+    let _: () = msg_send![win, setReleasedWhenClosed: false];
+
+    if msg_send![win, respondsToSelector: sel!(setCollectionBehavior:)]
+        && msg_send![win, respondsToSelector: sel!(collectionBehavior)]
+    {
+        let existing: u64 = msg_send![win, collectionBehavior];
+        let move_to_active_space: u64 = 1u64 << 1;
+        let transient: u64 = 1u64 << 3;
+        let _: () = msg_send![win, setCollectionBehavior: existing | move_to_active_space | transient];
+    }
+
+    // 内容视图和表格
+    let content_view: *mut AnyObject = msg_send![win, contentView];
+    if content_view.is_null() { return; }
+    let pad: f64 = 16.0;
+    let cv_frame: NSRect = msg_send![content_view, frame];
+    let scroll_frame = NSRect {
+        origin: NSPoint { x: pad, y: pad },
+        size: NSSize { width: cv_frame.size.width - 2.0 * pad, height: cv_frame.size.height - 2.0 * pad },
+    };
+
+    let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
+    let scroll: *mut AnyObject = msg_send![scroll, initWithFrame: scroll_frame];
+    if msg_send![scroll, respondsToSelector: sel!(setAutoresizingMask:)] {
+        // Width + Height sizable
+        let mask: u64 = (1u64 << 1) | (1u64 << 4);
+        let _: () = msg_send![scroll, setAutoresizingMask: mask];
+    }
+
+    let cls = ensure_click_handler_class();
+    let handler: Retained<AnyObject> = msg_send![cls, new];
+
+    // 主题窗口应使用 ThemeTableView（键盘上下移动时也触发 action，且使用箭头光标）
+    let table_cls = ensure_theme_tableview_class();
+    let table: *mut AnyObject = msg_send![table_cls, alloc];
+    let table: *mut AnyObject = msg_send![table, initWithFrame: NSRect { origin: NSPoint { x: 0.0, y: 0.0 }, size: NSSize { width: scroll_frame.size.width, height: scroll_frame.size.height } }];
+    // 提前记录全局指针，确保数据源/委托方法能识别“主题表”
+    THEME_TABLE_PTR.store(table, Ordering::Relaxed);
+    if msg_send![table, respondsToSelector: sel!(setAutoresizingMask:)] {
+        let mask: u64 = (1u64 << 1) | (1u64 << 4);
+        let _: () = msg_send![table, setAutoresizingMask: mask];
+    }
+    // 仅单选，不允许空选；使用常规高亮样式
+    let _: () = msg_send![table, setAllowsMultipleSelection: false];
+    if msg_send![table, respondsToSelector: sel!(setAllowsEmptySelection:)] {
+        let _: () = msg_send![table, setAllowsEmptySelection: false];
+    }
+    if msg_send![table, respondsToSelector: sel!(setSelectionHighlightStyle:)] {
+        // NSTableViewSelectionHighlightStyleRegular
+        let _: () = msg_send![table, setSelectionHighlightStyle: 0u64];
+    }
+    let col: *mut AnyObject = msg_send![class!(NSTableColumn), alloc];
+    let identifier = NSString::from_str("ThemeColumn");
+    let col: *mut AnyObject = msg_send![col, initWithIdentifier: &*identifier];
+    let _: () = msg_send![col, setWidth: scroll_frame.size.width];
+    if msg_send![col, respondsToSelector: sel!(setResizingMask:)] {
+        let _: () = msg_send![col, setResizingMask: 1u64];
+    }
+    if msg_send![table, respondsToSelector: sel!(setColumnAutoresizingStyle:)] {
+        let _: () = msg_send![table, setColumnAutoresizingStyle: 4u64];
+    }
+    let _: () = msg_send![table, addTableColumn: col];
+    if msg_send![table, respondsToSelector: sel!(sizeLastColumnToFit)] {
+        let _: () = msg_send![table, sizeLastColumnToFit];
+    }
+    let _: () = msg_send![table, setHeaderView: std::ptr::null::<AnyObject>()];
+    let _: () = msg_send![table, setUsesAlternatingRowBackgroundColors: true];
+    if msg_send![table, respondsToSelector: sel!(setGridStyleMask:)] {
+        let _: () = msg_send![table, setGridStyleMask: 0u64];
+    }
+    let _: () = msg_send![table, setRowHeight: 22.0f64];
+    let spacing = NSSize { width: 0.0, height: 2.0 };
+    let _: () = msg_send![table, setIntercellSpacing: spacing];
+    let _: () = msg_send![table, setAllowsMultipleSelection: false];
+    let _: () = msg_send![table, setDataSource: &*handler];
+    let _: () = msg_send![table, setDelegate: &*handler];
+    // 单击行回调：切换主题
+    let _: () = msg_send![table, setTarget: &*handler];
+    let _: () = msg_send![table, setAction: sel!(onThemeRowClick:)];
+    // 监听选中变化通知，确保键盘/鼠标变更都立即应用主题
+    let nc: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+    let name = NSString::from_str("NSTableViewSelectionDidChangeNotification");
+    let _: () = msg_send![nc, addObserver: &*handler, selector: sel!(onThemeSelectionChanged:), name: &*name, object: table];
+
+    let _: () = msg_send![scroll, setHasVerticalScroller: true];
+    let _: () = msg_send![scroll, setDocumentView: table];
+    let _: () = msg_send![content_view, addSubview: scroll];
+
+    THEME_WINDOW_PTR.store(win, Ordering::Relaxed);
+    update_theme_table();
+
+    // 初始选中当前主题所在行
+    if let Some(cur) = read_current_theme_expanded() {
+        let mut match_idx: isize = -1;
+        let themes = list_theme_files();
+        for (i, p) in themes.iter().enumerate() {
+            if expand_tilde(&theme_path_to_tilde(p)) == cur {
+                match_idx = i as isize;
+                break;
+            }
+        }
+        if match_idx >= 0 {
+            // selectRowIndexes:byExtendingSelection:
+            let set: Retained<AnyObject> = msg_send![class!(NSIndexSet), indexSetWithIndex: match_idx as u64];
+            let _: () = msg_send![table, selectRowIndexes: &*set, byExtendingSelection: false];
+            let _: () = msg_send![table, scrollRowToVisible: match_idx];
+        }
+    }
+
+    crate::macos::activation_guard::suppress_next_activation_restore();
+    let app: *mut NSApplication = msg_send![class!(NSApplication), sharedApplication];
+    let _: () = msg_send![app, activateIgnoringOtherApps: true];
+    let _: () = msg_send![win, center];
+    // 让主题表成为第一响应者，保证上下键立即生效
+    let _: Bool = msg_send![win, makeFirstResponder: table];
+    let _: () = msg_send![win, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+
     std::mem::forget(handler);
 }

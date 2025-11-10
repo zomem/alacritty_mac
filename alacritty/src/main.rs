@@ -186,6 +186,10 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
     #[cfg(target_os = "macos")]
     macos::disable_autofill();
 
+    // 禁用系统的“自动窗口标签页”，避免隐藏/显示后被自动合并为标签。
+    #[cfg(target_os = "macos")]
+    macos::disable_automatic_window_tabbing();
+
     // 在 macOS 菜单栏显示文字（示例：Alacritty），并注入事件代理用于菜单项操作。
     #[cfg(target_os = "macos")]
     {
